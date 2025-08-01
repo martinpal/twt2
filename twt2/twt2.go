@@ -6,18 +6,19 @@ import (
 	"io"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	proto "github.com/golang/protobuf/proto"
-	log "github.com/sirupsen/logrus"
-
-	twtproto "palecci.cz/twtproto"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
+	"google.golang.org/protobuf/proto"
+	"palecci.cz/twtproto"
 )
+
+var log = logrus.StandardLogger()
 
 const proxyID = 0
 const chunkSize = 1280
@@ -27,24 +28,28 @@ var app *App
 type Handler func(http.ResponseWriter, *http.Request)
 
 type PoolConnection struct {
-	Conn     net.Conn
-	SendChan chan *twtproto.ProxyComm
-	ID       uint64
-	InUse    bool
-	LastUsed time.Time
+	Conn      net.Conn
+	SendChan  chan *twtproto.ProxyComm
+	ID        uint64
+	InUse     bool
+	LastUsed  time.Time
+	SSHClient *ssh.Client // SSH client for this connection
+	SSHConn   net.Conn    // SSH connection
+	LocalPort int         // Local port for SSH tunnel
 }
 
 type Connection struct {
 	Connection   net.Conn
-	LastSeqIn    uint64                        // last sequence number we have used for the last incoming chunk
-	NextSeqOut   uint64                        // next sequence number to be sent out
-	MessageQueue map[uint64]twtproto.ProxyComm // queue of messages with too high sequence numbers
+	LastSeqIn    uint64                         // last sequence number we have used for the last incoming chunk
+	NextSeqOut   uint64                         // next sequence number to be sent out
+	MessageQueue map[uint64]*twtproto.ProxyComm // queue of messages with too high sequence numbers
 }
 
 type App struct {
 	ListenPort            int
 	PeerHost              string
 	PeerPort              int
+	SSHPort               int
 	Ping                  bool
 	DefaultRoute          Handler
 	PoolConnections       []*PoolConnection
@@ -61,11 +66,12 @@ func GetApp() *App {
 	return app
 }
 
-func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool) *App {
+func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int) *App {
 	app := &App{
 		ListenPort:        listenPort,
 		PeerHost:          peerHost,
 		PeerPort:          peerPort,
+		SSHPort:           sshPort,
 		Ping:              ping,
 		DefaultRoute:      f,
 		PoolConnections:   make([]*PoolConnection, 0, poolCap),
@@ -80,7 +86,7 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 
 		// Initialize pool connections
 		for i := 0; i < poolInit; i++ {
-			poolConn := createPoolConnection(uint64(i), app.PeerHost, app.PeerPort, ping)
+			poolConn := createPoolConnection(uint64(i), app.PeerHost, app.PeerPort, ping, sshUser, sshKeyPath, app.SSHPort)
 			if poolConn != nil {
 				app.PoolConnections = append(app.PoolConnections, poolConn)
 			}
@@ -94,20 +100,68 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 	return app
 }
 
-func createPoolConnection(id uint64, host string, port int, ping bool) *PoolConnection {
-	log.Tracef("Creating pool connection %d to %s:%d", id, host, port)
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+func createPoolConnection(id uint64, host string, port int, ping bool, sshUser string, sshKeyPath string, sshPort int) *PoolConnection {
+	log.Tracef("Creating SSH tunnel connection %d to %s@%s:%d (SSH port %d)", id, sshUser, host, port, sshPort)
+
+	// Read SSH private key
+	keyBytes, err := os.ReadFile(sshKeyPath)
 	if err != nil {
-		log.Errorf("Error creating pool connection %d to %s:%d: %v", id, host, port, err)
+		log.Errorf("Error reading SSH key file %s for connection %d: %v", sshKeyPath, id, err)
+		return nil
+	}
+
+	// Parse SSH private key
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		log.Errorf("Error parsing SSH key for connection %d: %v", id, err)
+		return nil
+	}
+
+	// SSH client configuration
+	config := &ssh.ClientConfig{
+		User: sshUser,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // For automated connections
+		Timeout:         10 * time.Second,
+	}
+
+	// Connect to SSH server
+	sshConn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, sshPort), config)
+	if err != nil {
+		log.Errorf("Error connecting to SSH server %s:%d for connection %d: %v", host, sshPort, id, err)
+		return nil
+	}
+
+	// Create local port forward
+	localListener, err := net.Listen("tcp", "127.0.0.1:0") // Use port 0 for automatic assignment
+	if err != nil {
+		log.Errorf("Error creating local listener for connection %d: %v", id, err)
+		sshConn.Close()
+		return nil
+	}
+
+	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localListener.Close() // Close the listener, we just needed the port
+
+	// Connect to the target service through SSH tunnel
+	remoteConn, err := sshConn.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		log.Errorf("Error connecting through SSH tunnel for connection %d: %v", id, err)
+		sshConn.Close()
 		return nil
 	}
 
 	poolConn := &PoolConnection{
-		Conn:     conn,
-		SendChan: make(chan *twtproto.ProxyComm, 100),
-		ID:       id,
-		InUse:    false,
-		LastUsed: time.Now(),
+		Conn:      remoteConn,
+		SendChan:  make(chan *twtproto.ProxyComm, 100),
+		ID:        id,
+		InUse:     false,
+		LastUsed:  time.Now(),
+		SSHClient: sshConn,
+		SSHConn:   remoteConn,
+		LocalPort: localPort,
 	}
 
 	// Start goroutines for this connection
@@ -123,6 +177,7 @@ func createPoolConnection(id uint64, host string, port int, ping bool) *PoolConn
 		poolConn.SendChan <- pingMessage
 	}
 
+	log.Infof("SSH tunnel connection %d established: direct tunnel -> %s@%s:%d (protobuf port %d)", id, sshUser, host, sshPort, port)
 	return poolConn
 }
 
@@ -163,7 +218,7 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 	app.LocalConnectionMutex.Lock()
 	thisConnection := app.LastLocalConnection
 	app.LastLocalConnection++
-	app.LocalConnections[thisConnection] = Connection{Connection: conn, LastSeqIn: 0, MessageQueue: make(map[uint64]twtproto.ProxyComm)}
+	app.LocalConnections[thisConnection] = Connection{Connection: conn, LastSeqIn: 0, MessageQueue: make(map[uint64]*twtproto.ProxyComm)}
 	app.LocalConnectionMutex.Unlock()
 
 	connectMessage := &twtproto.ProxyComm{
@@ -345,7 +400,7 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 		log.Tracef("Seq DOWN %d %d", message.Seq, thisConnection.NextSeqOut)
 		if message.Seq != thisConnection.NextSeqOut {
 			log.Tracef("Queueing message UP conn %d seq %d", message.Connection, message.Seq)
-			thisConnection.MessageQueue[message.Seq] = *message
+			thisConnection.MessageQueue[message.Seq] = message
 			mutex.Unlock()
 			return
 		}
@@ -356,7 +411,7 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 		thisConnection, ok := app.RemoteConnections[message.Connection]
 		if !ok {
 			log.Tracef("No such connection %d, seq %d, adding", message.Connection, message.Seq)
-			app.RemoteConnections[message.Connection] = Connection{Connection: nil, LastSeqIn: 0, NextSeqOut: 0, MessageQueue: make(map[uint64]twtproto.ProxyComm)}
+			app.RemoteConnections[message.Connection] = Connection{Connection: nil, LastSeqIn: 0, NextSeqOut: 0, MessageQueue: make(map[uint64]*twtproto.ProxyComm)}
 			thisConnection, _ = app.RemoteConnections[message.Connection]
 		}
 		log.Tracef("Seq UP %d %d", message.Seq, thisConnection.NextSeqOut)
@@ -368,7 +423,7 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 				return
 			}
 			log.Tracef("Queueing message UP conn %d seq %d", message.Connection, message.Seq)
-			thisConnection.MessageQueue[message.Seq] = *message
+			thisConnection.MessageQueue[message.Seq] = message
 			mutex.Unlock()
 			return
 		}
@@ -397,13 +452,13 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 		//    log.Tracef("Message: %v", queueMessage)
 		switch queueMessage.Mt {
 		case twtproto.ProxyComm_CLOSE_CONN_C:
-			closeConnectionLocal(&queueMessage)
+			closeConnectionLocal(queueMessage)
 		case twtproto.ProxyComm_DATA_DOWN:
-			backwardDataChunk(&queueMessage)
+			backwardDataChunk(queueMessage)
 		case twtproto.ProxyComm_CLOSE_CONN_S:
-			closeConnectionRemote(&queueMessage)
+			closeConnectionRemote(queueMessage)
 		case twtproto.ProxyComm_DATA_UP:
-			forwardDataChunk(&queueMessage)
+			forwardDataChunk(queueMessage)
 		}
 		delete((*connections)[queueMessage.Connection].MessageQueue, seq)
 		seq++
@@ -414,7 +469,7 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 
 func newConnection(message *twtproto.ProxyComm) {
 	log.Infof("Openning connection %4d to %s:%d", message.Connection, message.Address, message.Port)
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", message.Address, message.Port))
+	conn, err := net.Dial("tcp", net.JoinHostPort(message.Address, strconv.Itoa(int(message.Port))))
 	if err != nil {
 		log.Fatal(err)
 		return
@@ -422,7 +477,7 @@ func newConnection(message *twtproto.ProxyComm) {
 	thisConnection, ok := app.RemoteConnections[message.Connection]
 	if !ok {
 		log.Tracef("Connection %4d not known, creating record", message.Connection)
-		app.RemoteConnections[message.Connection] = Connection{Connection: conn, LastSeqIn: 0, NextSeqOut: 1, MessageQueue: make(map[uint64]twtproto.ProxyComm)}
+		app.RemoteConnections[message.Connection] = Connection{Connection: conn, LastSeqIn: 0, NextSeqOut: 1, MessageQueue: make(map[uint64]*twtproto.ProxyComm)}
 	} else {
 		log.Tracef("Connection %4d record already exists, setting conn field to newly dialed connection", message.Connection)
 		thisConnection.Connection = conn
@@ -535,12 +590,12 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 }
 
 func ProtobufServer(listenPort int) {
-	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", listenPort))
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort))
 	if err != nil {
 		log.Fatalf("Error listening: %s", err.Error())
 	}
 	defer l.Close()
-	log.Infof("Listening on 0.0.0.0:%d", listenPort)
+	log.Infof("Listening on 127.0.0.1:%d (loopback only for SSH tunneling)", listenPort)
 	for {
 		log.Trace("Listening for an incoming connection")
 		conn, err := l.Accept()

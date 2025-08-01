@@ -4,6 +4,8 @@ TW2 (Trans-Warp 2) is a high-performance HTTP proxy tunnel system written in Go 
 
 TW2 implements HTTP CONNECT method tunneling, which is the standard method for proxying any TCP-based traffic through HTTP proxies. This makes it compatible with HTTPS, SSH, and any other protocol that needs to be tunneled through an HTTP proxy.
 
+**Security**: TW2 uses SSH tunneling for all connections between client and server, providing strong encryption and SSH key-based authentication. Each tunnel connection uses an independent SSH session to prevent multiplexing vulnerabilities.
+
 ## Overview
 
 TW2 consists of two main components that work together to create a secure tunnel:
@@ -16,18 +18,21 @@ The system uses connection pooling, sequence numbering, and message queuing to e
 ## Architecture
 
 ```
-Client → HTTP Proxy → ProtoBuf Tunnel → Remote ProtoBuf Server → Target Server
+Client → HTTP Proxy → SSH Tunnel → Remote SSH → ProtoBuf Server → Target Server
 ```
 
 ### Key Features
 
+- **SSH Tunneling**: All tunnel connections use independent SSH sessions for strong encryption and authentication
+- **SSH Key Authentication**: Uses SSH public key authentication (no passwords)
 - **HTTP CONNECT Method**: Implements standard HTTP CONNECT tunneling for universal protocol support
-- **Connection Pooling**: Maintains a pool of persistent connections for efficient data transfer
+- **Connection Pooling**: Maintains a pool of persistent SSH tunnel connections for efficient data transfer
 - **Sequence Numbering**: Ensures ordered delivery of data packets
 - **Message Queuing**: Handles out-of-order messages and connection reliability
 - **Concurrent Processing**: Uses goroutines for handling multiple connections simultaneously
 - **Configurable Logging**: Multiple log levels for debugging and monitoring
 - **Connection Management**: Automatic cleanup and resource management
+- **Independent SSH Sessions**: Each pool connection uses its own SSH process (no ControlMaster)
 
 ### Protocol Messages
 
@@ -72,6 +77,11 @@ The system uses Protocol Buffers with the following message types:
 
 1. Install Go 1.13 or later
 2. Install Protocol Buffer compiler (protoc) if modifying `.proto` files
+3. **SSH Setup (Required)**:
+   - SSH server running on the target host
+   - SSH public key authentication configured
+   - SSH client installed on the client machine
+   - Valid SSH private key file accessible to TW2
 
 ### Build Instructions
 
@@ -101,6 +111,55 @@ cd ../main
 go build -o tw2
 ```
 
+## SSH Setup
+
+### Server Side Setup
+
+1. **Install SSH server** (if not already installed):
+   ```bash
+   # Ubuntu/Debian
+   sudo apt-get install openssh-server
+   
+   # CentOS/RHEL
+   sudo yum install openssh-server
+   ```
+
+2. **Configure SSH server** (`/etc/ssh/sshd_config`):
+   ```
+   PubkeyAuthentication yes
+   AuthorizedKeysFile .ssh/authorized_keys
+   PasswordAuthentication no  # Recommended for security
+   ```
+
+3. **Restart SSH service**:
+   ```bash
+   sudo systemctl restart sshd
+   ```
+
+### Client Side Setup
+
+1. **Generate SSH key pair** (if you don't have one):
+   ```bash
+   ssh-keygen -t rsa -b 4096 -f ~/.ssh/tw2_key
+   ```
+
+2. **Copy public key to server**:
+   ```bash
+   ssh-copy-id -i ~/.ssh/tw2_key.pub user@remote-server.com
+   ```
+
+3. **Test SSH connection**:
+   ```bash
+   ssh -i ~/.ssh/tw2_key user@remote-server.com
+   ```
+
+### Security Notes
+
+- TW2 disables SSH ControlMaster to ensure independent connections
+- Each tunnel connection uses its own SSH process for isolation
+- SSH StrictHostKeyChecking is disabled for automated connections
+- Consider using dedicated SSH keys for TW2 tunnel connections
+
 ## Usage
 
 ### Command Line Options
@@ -109,29 +168,32 @@ go build -o tw2
 ./tw2 [options]
 
 Options:
-  -L int     Log level: (1) Error, (2) Warn, (3) Info, (4) Debug, (5) Trace (default 2)
-  -l int     HTTP proxy port to listen on (client mode only) (default 3128)
-  -h string  Address of the peer host (client mode only) (default "127.0.0.1")
-  -p int     Port of the peer on peer host (client mode only) (default 33333)
-  -b int     ProtoBuf port to listen on (default 33333)
-  -i int     Initial size of connection pool (client mode only) (default 100)
-  -c int     Maximum size of connection pool (client mode only) (default 500)
-  -ping      Enable ping on pool connections (client mode only) (default false)
-  -server    Run in server mode (only ProtoBuf server, no HTTP proxy) (default false)
+  -L int        Log level: (1) Error, (2) Warn, (3) Info, (4) Debug, (5) Trace (default 2)
+  -l int        HTTP proxy port to listen on (client mode only) (default 3128)
+  -h string     Address of the peer host (client mode only) (default "127.0.0.1")
+  -p int        Port of the peer on peer host (client mode only) (default 33333)
+  -b int        ProtoBuf port to listen on (default 33333)
+  -i int        Initial size of connection pool (client mode only) (default 100)
+  -c int        Maximum size of connection pool (client mode only) (default 500)
+  -ping         Enable ping on pool connections (client mode only) (default false)
+  -server       Run in server mode (only ProtoBuf server, no HTTP proxy) (default false)
+  -ssh-user string   SSH username for tunnel connections (required in client mode)
+  -ssh-key string    Path to SSH private key file (required in client mode)
 ```
 
 ### Basic Usage Examples
 
 #### Server Mode (Remote End)
 ```bash
-# Start the tunnel server (no HTTP proxy)
+# Start the tunnel server (listens on loopback only for SSH)
 ./tw2 -server -L 2 -b 33333
 ```
 
 #### Client Mode (Local End)
 ```bash
-# Start the client with HTTP proxy
-./tw2 -L 2 -h remote-server.com -p 33333 -l 3128 -b 33334
+# Start the client with HTTP proxy and SSH tunnel
+./tw2 -L 2 -h remote-server.com -p 33333 -l 3128 -b 33334 \
+     -ssh-user tunneluser -ssh-key ~/.ssh/id_rsa
 ```
 
 #### Single Host Testing
@@ -139,8 +201,9 @@ Options:
 # Terminal 1: Start server
 ./tw2 -server -b 33333
 
-# Terminal 2: Start client  
-./tw2 -h 127.0.0.1 -p 33333 -l 3128 -b 33334
+# Terminal 2: Start client (requires SSH server running locally)
+./tw2 -h 127.0.0.1 -p 33333 -l 3128 -b 33334 \
+     -ssh-user $USER -ssh-key ~/.ssh/id_rsa
 ```
 
 ## Monitoring
@@ -186,9 +249,13 @@ protoc --go_out=. --go_opt=paths=source_relative twt.proto
 
 ## Security Considerations
 
-- The tunnel does not provide encryption by default.
-- All data is forwarded without any additional encryption. The clients are responsible for securing their own connections (TLS/SSL, SSH).
-- There is no built-in authentication.
+- **SSH Encryption**: All tunnel traffic is encrypted using SSH's strong encryption algorithms
+- **SSH Key Authentication**: Only SSH public key authentication is supported (no passwords)
+- **Independent SSH Sessions**: Each tunnel connection uses a separate SSH process to prevent session hijacking
+- **Loopback Only**: Server side only listens on loopback interface (127.0.0.1)
+- **No ControlMaster**: SSH ControlMaster is explicitly disabled to prevent connection sharing vulnerabilities
+- **SSH Key Management**: Protect SSH private keys with appropriate file permissions (600)
+- **Firewall**: Only SSH port (22) needs to be open on the server side
 
 ## Performance Tuning
 
