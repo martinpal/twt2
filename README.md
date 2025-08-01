@@ -110,23 +110,37 @@ go build -o tw2
 
 Options:
   -L int     Log level: (1) Error, (2) Warn, (3) Info, (4) Debug, (5) Trace (default 2)
-  -l int     HTTP proxy port to listen on (default 3128)
-  -h string  Address of the peer host (default "127.0.0.1")
-  -p int     Port of the peer on peer host (default 33333)
+  -l int     HTTP proxy port to listen on (client mode only) (default 3128)
+  -h string  Address of the peer host (client mode only) (default "127.0.0.1")
+  -p int     Port of the peer on peer host (client mode only) (default 33333)
   -b int     ProtoBuf port to listen on (default 33333)
-  -i int     Initial size of connection pool (default 100)
-  -c int     Maximum size of connection pool (default 500)
-  -ping      Enable ping on pool connections (default false)
+  -i int     Initial size of connection pool (client mode only) (default 100)
+  -c int     Maximum size of connection pool (client mode only) (default 500)
+  -ping      Enable ping on pool connections (client mode only) (default false)
+  -server    Run in server mode (only ProtoBuf server, no HTTP proxy) (default false)
 ```
 
 ### Basic Usage Examples
 
+#### Server Mode (Remote End)
 ```bash
-# On the tunnel server (remote end)
-./tw2 -L 2 -b 33333 -l 3128
+# Start the tunnel server (no HTTP proxy)
+./tw2 -server -L 2 -b 33333
+```
 
-# On the client end  
+#### Client Mode (Local End)
+```bash
+# Start the client with HTTP proxy
 ./tw2 -L 2 -h remote-server.com -p 33333 -l 3128 -b 33334
+```
+
+#### Single Host Testing
+```bash
+# Terminal 1: Start server
+./tw2 -server -b 33333
+
+# Terminal 2: Start client  
+./tw2 -h 127.0.0.1 -p 33333 -l 3128 -b 33334
 ```
 
 ## Monitoring

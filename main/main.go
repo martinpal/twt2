@@ -46,9 +46,7 @@ func setLogLevel(logLevel *int) {
 func stats() {
 	time.AfterFunc(5*time.Second, stats)
 	if twt2.GetApp() != nil {
-		if twt2.GetApp().ConnectionPool != nil {
-			log.Infof("Connection pool length: %d", twt2.GetApp().ConnectionPool.Len())
-		}
+		log.Infof("Pool connections: %d", len(twt2.GetApp().PoolConnections))
 		twt2.GetApp().LocalConnectionMutex.Lock()
 		twt2.GetApp().RemoteConnectionMutex.Lock()
 		log.Infof("Local connection: %4d, Remote connections: %4d", len(twt2.GetApp().LocalConnections), len(twt2.GetApp().RemoteConnections))
@@ -78,30 +76,59 @@ func main() {
 	poolInit := flag.Int("i", 100, "Initial size of the connection pool between the ends of tunnel")
 	poolCap := flag.Int("c", 500, "Cap of the connection pool size")
 	pingPool := flag.Bool("ping", false, "To ping or not to ping on the connection pool connections")
+	serverMode := flag.Bool("server", false, "Run in server mode (only ProtoBuf server, no HTTP proxy)")
 	flag.Parse()
 	setLogLevel(logLevel)
-	log.Infof("Proxy port %d\n", *proxyport)
-	log.Infof("Peer host:port %s:%d\n", *peerHost, *peerPort)
-	log.Infof("Listening port %d\n", *listenPort)
-	log.Infof("Initial pool size %d\n", *poolInit)
-	log.Infof("Maximum pool size %d\n", *poolCap)
-	if *pingPool {
-		log.Info("Will ping connections in pool")
+
+	// Determine if this is client or server mode
+	isClient := !*serverMode
+
+	if isClient {
+		log.Info("Running in CLIENT mode")
+		log.Infof("HTTP Proxy port %d\n", *proxyport)
+		log.Infof("Peer host:port %s:%d\n", *peerHost, *peerPort)
 	} else {
-		log.Info("Will not ping connections in pool")
+		log.Info("Running in SERVER mode")
+		log.Info("HTTP proxy disabled in server mode")
 	}
 
-	// remote side
+	log.Infof("ProtoBuf listening port %d\n", *listenPort)
+	if isClient {
+		log.Infof("Initial pool size %d\n", *poolInit)
+		log.Infof("Maximum pool size %d\n", *poolCap)
+		if *pingPool {
+			log.Info("Will ping connections in pool")
+		} else {
+			log.Info("Will not ping connections in pool")
+		}
+	}
+
+	// Always start protobuf server (both client and server modes need this)
 	go twt2.ProtobufServer(*listenPort)
-	time.Sleep(5000 * time.Millisecond)
-	// http proxy side
-	twt2.NewApp(twt2.Hijack, *listenPort, *peerHost, *peerPort, *poolInit, *poolCap, *pingPool)
+	time.Sleep(1000 * time.Millisecond) // Reduced sleep time
+
+	// Create app instance
+	twt2.NewApp(twt2.Hijack, *listenPort, *peerHost, *peerPort, *poolInit, *poolCap, *pingPool, isClient)
 	defer func() {
-		if twt2.GetApp().ConnectionPool != nil {
-			twt2.GetApp().ConnectionPool.Release()
+		// Cleanup pool connections (only relevant for client mode)
+		if twt2.GetApp() != nil {
+			for _, poolConn := range twt2.GetApp().PoolConnections {
+				close(poolConn.SendChan)
+				poolConn.Conn.Close()
+			}
 		}
 	}()
+
 	log.Warn("Ready to serve")
 	go stats()
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *proxyport), twt2.GetApp()))
+
+	if isClient {
+		// Only start HTTP proxy in client mode
+		log.Infof("Starting HTTP proxy on port %d", *proxyport)
+		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *proxyport), twt2.GetApp()))
+	} else {
+		// Server mode - just keep the program running
+		log.Info("Server mode - only ProtoBuf server is running")
+		select {} // Block forever
+	}
 }

@@ -14,7 +14,6 @@ import (
 	"time"
 
 	proto "github.com/golang/protobuf/proto"
-	pool "github.com/silenceper/pool"
 	log "github.com/sirupsen/logrus"
 
 	twtproto "palecci.cz/twtproto"
@@ -26,6 +25,14 @@ const chunkSize = 1280
 var app *App
 
 type Handler func(http.ResponseWriter, *http.Request)
+
+type PoolConnection struct {
+	Conn     net.Conn
+	SendChan chan *twtproto.ProxyComm
+	ID       uint64
+	InUse    bool
+	LastUsed time.Time
+}
 
 type Connection struct {
 	Connection   net.Conn
@@ -40,7 +47,9 @@ type App struct {
 	PeerPort              int
 	Ping                  bool
 	DefaultRoute          Handler
-	ConnectionPool        pool.Pool
+	PoolConnections       []*PoolConnection
+	PoolMutex             sync.Mutex
+	PoolSize              int
 	LocalConnectionMutex  sync.Mutex
 	LastLocalConnection   uint64
 	LocalConnections      map[uint64]Connection
@@ -52,62 +61,83 @@ func GetApp() *App {
 	return app
 }
 
-func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool) *App {
+func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool) *App {
 	app := &App{
 		ListenPort:        listenPort,
 		PeerHost:          peerHost,
 		PeerPort:          peerPort,
 		Ping:              ping,
 		DefaultRoute:      f,
+		PoolConnections:   make([]*PoolConnection, 0, poolCap),
+		PoolSize:          poolCap,
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
 	}
 
-	log.Debug("Creating connection pool")
+	// Only create pool connections on client side
+	if isClient && peerHost != "" {
+		log.Debug("Creating bidirectional connection pool (client side)")
 
-	pingFunc := func(v interface{}) error { return nil }
-	if ping {
-		pingFunc = func(v interface{}) error {
-			pingMessage := &twtproto.ProxyComm{
-				Mt:    twtproto.ProxyComm_PING,
-				Proxy: proxyID,
+		// Initialize pool connections
+		for i := 0; i < poolInit; i++ {
+			poolConn := createPoolConnection(uint64(i), app.PeerHost, app.PeerPort, ping)
+			if poolConn != nil {
+				app.PoolConnections = append(app.PoolConnections, poolConn)
 			}
-			sendProtobufToConn(v.(net.Conn), pingMessage)
-			return nil
 		}
+
+		log.Debugf("Created %d pool connections", len(app.PoolConnections))
+	} else {
+		log.Debug("Server side - no pool connections created")
 	}
-	factory := func() (interface{}, error) {
-		log.Tracef("Connecting to %s:%d", app.PeerHost, app.PeerPort)
-		conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", app.PeerHost, app.PeerPort))
-		if err == nil {
-			pingFunc(conn)
-		} else {
-			log.Errorf("Error connecting to %s:%d", app.PeerHost, app.PeerPort)
-		}
-		return conn, err
-	}
-	close := func(v interface{}) error { return v.(net.Conn).Close() }
-	poolConfig := &pool.Config{
-		InitialCap: poolInit,
-		MaxIdle:    poolCap,
-		MaxCap:     poolCap,
-		Factory:    factory,
-		Close:      close,
-		Ping:       pingFunc,
-		//    IdleTimeout: 15 * 60 * time.Second,
-	}
-	p, err := pool.NewChannelPool(poolConfig)
-	if err != nil {
-		fmt.Println("err=", err)
-	}
-	if p == nil {
-		log.Infof("p= %#v\n", p)
-		return nil
-	}
-	app.ConnectionPool = p
-	log.Debugf("Current conn pool length: %d\n", app.ConnectionPool.Len())
 
 	return app
+}
+
+func createPoolConnection(id uint64, host string, port int, ping bool) *PoolConnection {
+	log.Tracef("Creating pool connection %d to %s:%d", id, host, port)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		log.Errorf("Error creating pool connection %d to %s:%d: %v", id, host, port, err)
+		return nil
+	}
+
+	poolConn := &PoolConnection{
+		Conn:     conn,
+		SendChan: make(chan *twtproto.ProxyComm, 100),
+		ID:       id,
+		InUse:    false,
+		LastUsed: time.Now(),
+	}
+
+	// Start goroutines for this connection
+	go poolConnectionSender(poolConn)
+	go poolConnectionReceiver(poolConn)
+
+	// Send initial ping if enabled
+	if ping {
+		pingMessage := &twtproto.ProxyComm{
+			Mt:    twtproto.ProxyComm_PING,
+			Proxy: proxyID,
+		}
+		poolConn.SendChan <- pingMessage
+	}
+
+	return poolConn
+}
+
+func poolConnectionSender(poolConn *PoolConnection) {
+	log.Tracef("Starting sender goroutine for pool connection %d", poolConn.ID)
+	for message := range poolConn.SendChan {
+		sendProtobufToConn(poolConn.Conn, message)
+	}
+	log.Tracef("Sender goroutine for pool connection %d ended", poolConn.ID)
+}
+
+func poolConnectionReceiver(poolConn *PoolConnection) {
+	log.Tracef("Starting receiver goroutine for pool connection %d", poolConn.ID)
+	handleConnection(poolConn.Conn)
+	log.Tracef("Receiver goroutine for pool connection %d ended", poolConn.ID)
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -206,16 +236,43 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 }
 
 func sendProtobuf(message *twtproto.ProxyComm) {
-	v, err := app.ConnectionPool.Get()
-	if err != nil {
-		log.Fatalf("Error getting connection from pool: %v", err)
+	app.PoolMutex.Lock()
+	defer app.PoolMutex.Unlock()
+
+	// Find an available pool connection
+	var selectedConn *PoolConnection
+	for _, poolConn := range app.PoolConnections {
+		if !poolConn.InUse {
+			selectedConn = poolConn
+			break
+		}
 	}
-	log.Tracef("Got connection endpoint: %s", v.(net.Conn).LocalAddr().String())
-	log.Tracef("Current conn pool length: %d\n", app.ConnectionPool.Len())
-	sendProtobufToConn(v.(net.Conn), message)
-	log.Tracef("Returning connection endpoint: %s", v.(net.Conn).LocalAddr().String())
-	time.AfterFunc(50*time.Millisecond, func() { app.ConnectionPool.Put(v) })
-	log.Tracef("Current conn pool length: %d\n", app.ConnectionPool.Len())
+
+	// If no connection available, use the least recently used one
+	if selectedConn == nil && len(app.PoolConnections) > 0 {
+		selectedConn = app.PoolConnections[0]
+		for _, poolConn := range app.PoolConnections {
+			if poolConn.LastUsed.Before(selectedConn.LastUsed) {
+				selectedConn = poolConn
+			}
+		}
+	}
+
+	if selectedConn == nil {
+		log.Errorf("No pool connections available")
+		return
+	}
+
+	log.Tracef("Sending message via pool connection %d", selectedConn.ID)
+	selectedConn.LastUsed = time.Now()
+
+	// Send message through the channel (non-blocking)
+	select {
+	case selectedConn.SendChan <- message:
+		log.Tracef("Message queued for pool connection %d", selectedConn.ID)
+	default:
+		log.Warnf("Send channel full for pool connection %d", selectedConn.ID)
+	}
 }
 
 // protobuf server
