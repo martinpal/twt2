@@ -209,6 +209,9 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 
 		log.Warnf("Pool connection %d lost, attempting reconnection in %v", poolConn.ID, reconnectDelay)
 
+		// Clear any connection state that might be corrupted
+		clearConnectionState()
+
 		// Close existing connections
 		if poolConn.Conn != nil {
 			poolConn.Conn.Close()
@@ -264,6 +267,45 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 			reconnectDelay = maxReconnectDelay
 		}
 	}
+}
+
+// clearConnectionState clears potentially corrupted connection state
+func clearConnectionState() {
+	if app == nil {
+		return
+	}
+
+	log.Warnf("Clearing connection state due to connection failure")
+
+	// Clear local connections (client side)
+	app.LocalConnectionMutex.Lock()
+	localCount := len(app.LocalConnections)
+	for connID, conn := range app.LocalConnections {
+		if conn.Connection != nil {
+			conn.Connection.Close()
+		}
+		delete(app.LocalConnections, connID)
+	}
+	app.LocalConnectionMutex.Unlock()
+
+	// Clear remote connections (server side)
+	app.RemoteConnectionMutex.Lock()
+	remoteCount := len(app.RemoteConnections)
+	for connID, conn := range app.RemoteConnections {
+		if conn.Connection != nil {
+			conn.Connection.Close()
+		}
+		delete(app.RemoteConnections, connID)
+	}
+	app.RemoteConnectionMutex.Unlock()
+
+	// Clear the global protobuf connection
+	if protobufConnection != nil {
+		protobufConnection.Close()
+		protobufConnection = nil
+	}
+
+	log.Infof("Cleared %d local and %d remote connections", localCount, remoteCount)
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -423,6 +465,12 @@ func handleConnection(conn net.Conn) {
 	// Store the connection for server responses
 	protobufConnection = conn
 
+	defer func() {
+		// Ensure connection is closed when this function exits
+		conn.Close()
+		log.Tracef("handleConnection exiting, connection closed")
+	}()
+
 	for {
 		l := make([]byte, 2)
 		_, err := conn.Read(l)
@@ -431,6 +479,16 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 		length := int(l[1])*256 + int(l[0])
+
+		// Validate message length to detect frame corruption
+		const maxReasonableMessageSize = 64 * 1024 // 64KB max message size
+		if length <= 0 || length > maxReasonableMessageSize {
+			log.Errorf("Invalid message length %d (0x%x), frame sync lost. Length bytes: 0x%02x 0x%02x",
+				length, length, l[0], l[1])
+			log.Warnf("Closing connection due to frame corruption - will trigger reconnection")
+			return
+		}
+
 		log.Tracef("Expecting protobuf message long %d bytes", length)
 		B := make([]byte, 0, length)
 		b := make([]byte, length)
@@ -441,7 +499,7 @@ func handleConnection(conn net.Conn) {
 				if err != io.EOF {
 					fmt.Println("read error:", err)
 				}
-				break
+				return
 			}
 			B = append(B, b[:n]...)
 			b = make([]byte, cap(B)-len(B))
@@ -453,12 +511,14 @@ func handleConnection(conn net.Conn) {
 			if err := proto.Unmarshal(B, message); err != nil {
 				log.Warnf("Erroneous message hexdump length(%d): %s", length, hex.Dump(B))
 				log.Errorf("Failed to parse message length(%d): %v", length, err)
-				conn.Close()
+				log.Warnf("Closing connection due to protobuf parse error - will trigger reconnection")
 				return
 			}
 			handleProxycommMessage(message)
 		} else {
 			log.Errorf("Error receiving protobuf message, expected %4d, got %4d", length, len(B))
+			log.Warnf("Closing connection due to incomplete message - will trigger reconnection")
+			return
 		}
 	}
 }
