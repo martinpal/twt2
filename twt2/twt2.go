@@ -275,11 +275,11 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 }
 
 func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
-	log.Tracef("Marshalling message %v", message)
 	data, err := proto.Marshal(message)
 	if err != nil {
 		log.Fatal("marshaling error: ", err)
 	}
+	log.Tracef("Marshalling message hexdump length(%d): %s", len(data), hex.Dump(data))
 	length := len(data)
 	size := make([]byte, 2)
 	size[0] = byte(length & 255)
