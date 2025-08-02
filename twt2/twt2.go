@@ -67,7 +67,7 @@ func GetApp() *App {
 }
 
 func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int) *App {
-	app := &App{
+	appInstance := &App{
 		ListenPort:        listenPort,
 		PeerHost:          peerHost,
 		PeerPort:          peerPort,
@@ -86,17 +86,19 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 
 		// Initialize pool connections
 		for i := 0; i < poolInit; i++ {
-			poolConn := createPoolConnection(uint64(i), app.PeerHost, app.PeerPort, ping, sshUser, sshKeyPath, app.SSHPort)
+			poolConn := createPoolConnection(uint64(i), appInstance.PeerHost, appInstance.PeerPort, ping, sshUser, sshKeyPath, appInstance.SSHPort)
 			if poolConn != nil {
-				app.PoolConnections = append(app.PoolConnections, poolConn)
+				appInstance.PoolConnections = append(appInstance.PoolConnections, poolConn)
 			}
 		}
 
-		log.Debugf("Created %d pool connections", len(app.PoolConnections))
+		log.Debugf("Created %d pool connections", len(appInstance.PoolConnections))
 	} else {
 		log.Debug("Server side - no pool connections created")
 	}
 
+	// Set the global app variable so GetApp() returns the correct instance
+	app = appInstance
 	return app
 }
 
