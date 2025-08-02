@@ -50,6 +50,8 @@ type App struct {
 	PeerHost              string
 	PeerPort              int
 	SSHPort               int
+	SSHUser               string // SSH user for reconnection
+	SSHKeyPath            string // SSH key path for reconnection
 	Ping                  bool
 	DefaultRoute          Handler
 	PoolConnections       []*PoolConnection
@@ -72,6 +74,8 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 		PeerHost:          peerHost,
 		PeerPort:          peerPort,
 		SSHPort:           sshPort,
+		SSHUser:           sshUser,
+		SSHKeyPath:        sshKeyPath,
 		Ping:              ping,
 		DefaultRoute:      f,
 		PoolConnections:   make([]*PoolConnection, 0, poolCap),
@@ -193,8 +197,73 @@ func poolConnectionSender(poolConn *PoolConnection) {
 
 func poolConnectionReceiver(poolConn *PoolConnection) {
 	log.Tracef("Starting receiver goroutine for pool connection %d", poolConn.ID)
-	handleConnection(poolConn.Conn)
-	log.Tracef("Receiver goroutine for pool connection %d ended", poolConn.ID)
+
+	// Keep track of reconnection parameters
+	var reconnectDelay time.Duration = 1 * time.Second
+	const maxReconnectDelay = 30 * time.Second
+	const reconnectBackoffMultiplier = 2
+
+	for {
+		// Handle the connection - this will block until connection fails
+		handleConnection(poolConn.Conn)
+
+		log.Warnf("Pool connection %d lost, attempting reconnection in %v", poolConn.ID, reconnectDelay)
+
+		// Close existing connections
+		if poolConn.Conn != nil {
+			poolConn.Conn.Close()
+		}
+		if poolConn.SSHClient != nil {
+			poolConn.SSHClient.Close()
+		}
+
+		// Wait before reconnecting
+		time.Sleep(reconnectDelay)
+
+		// Attempt to recreate the connection
+		if app != nil {
+			newPoolConn := createPoolConnection(poolConn.ID, app.PeerHost, app.PeerPort, app.Ping, app.SSHUser, app.SSHKeyPath, app.SSHPort)
+			if newPoolConn != nil {
+				// Update the pool connection with new connection details
+				app.PoolMutex.Lock()
+				poolConn.Conn = newPoolConn.Conn
+				poolConn.SSHClient = newPoolConn.SSHClient
+				poolConn.SSHConn = newPoolConn.SSHConn
+				poolConn.LocalPort = newPoolConn.LocalPort
+				poolConn.LastUsed = time.Now()
+				app.PoolMutex.Unlock()
+
+				log.Infof("Pool connection %d successfully reconnected", poolConn.ID)
+
+				// Reset reconnection delay on successful connection
+				reconnectDelay = 1 * time.Second
+
+				// Send ping if enabled
+				if app.Ping {
+					pingMessage := &twtproto.ProxyComm{
+						Mt:    twtproto.ProxyComm_PING,
+						Proxy: proxyID,
+					}
+					select {
+					case poolConn.SendChan <- pingMessage:
+						log.Tracef("Reconnection ping queued for pool connection %d", poolConn.ID)
+					default:
+						log.Warnf("Could not queue reconnection ping for pool connection %d", poolConn.ID)
+					}
+				}
+
+				// Continue the loop to handle the new connection
+				continue
+			}
+		}
+
+		// Reconnection failed, increase delay with exponential backoff
+		log.Errorf("Failed to reconnect pool connection %d, retrying in %v", poolConn.ID, reconnectDelay)
+		reconnectDelay *= reconnectBackoffMultiplier
+		if reconnectDelay > maxReconnectDelay {
+			reconnectDelay = maxReconnectDelay
+		}
+	}
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
