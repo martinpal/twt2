@@ -1658,3 +1658,48 @@ func TestConnectionCleanup(t *testing.T) {
 		t.Error("Expected remote connection to be closed after delay")
 	}
 }
+
+// Test createPoolConnectionsParallel function
+func TestCreatePoolConnectionsParallel(t *testing.T) {
+	// Test with zero connections
+	connections := createPoolConnectionsParallel(0, "example.com", 22, false, "user", "/nonexistent/key", 22)
+	if len(connections) != 0 {
+		t.Errorf("Expected 0 connections for poolInit=0, got %d", len(connections))
+	}
+
+	// Test with small number of connections (all should fail due to nonexistent key)
+	connections = createPoolConnectionsParallel(5, "example.com", 22, false, "user", "/nonexistent/key", 22)
+	if len(connections) != 0 {
+		t.Errorf("Expected 0 connections with invalid key, got %d", len(connections))
+	}
+
+	// Test with larger number that would create multiple groups
+	connections = createPoolConnectionsParallel(25, "example.com", 22, false, "user", "/nonexistent/key", 22)
+	if len(connections) != 0 {
+		t.Errorf("Expected 0 connections with invalid key for 25 connections, got %d", len(connections))
+	}
+
+	// The function should handle the parallel processing correctly even when connections fail
+	// The test passes if it doesn't panic or hang
+}
+
+// Test NewApp with parallel pool creation
+func TestNewApp_ParallelPoolCreation(t *testing.T) {
+	handler := http.NotFoundHandler().ServeHTTP
+
+	// Test with a reasonable number of connections that would trigger parallel processing
+	app := NewApp(handler, 8080, "example.com", 22, 15, 20, true, true, "user", "/tmp/nonexistent", 22)
+
+	// Since the SSH key doesn't exist, no connections should be created
+	if len(app.PoolConnections) != 0 {
+		t.Errorf("Expected 0 pool connections with invalid SSH key, got %d", len(app.PoolConnections))
+	}
+
+	// Verify other app properties are set correctly
+	if app.ListenPort != 8080 {
+		t.Errorf("Expected ListenPort 8080, got %d", app.ListenPort)
+	}
+	if app.PeerHost != "example.com" {
+		t.Errorf("Expected PeerHost 'example.com', got %s", app.PeerHost)
+	}
+}

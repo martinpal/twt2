@@ -88,13 +88,8 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 	if isClient && peerHost != "" {
 		log.Debug("Creating bidirectional connection pool (client side)")
 
-		// Initialize pool connections
-		for i := 0; i < poolInit; i++ {
-			poolConn := createPoolConnection(uint64(i), appInstance.PeerHost, appInstance.PeerPort, ping, sshUser, sshKeyPath, appInstance.SSHPort)
-			if poolConn != nil {
-				appInstance.PoolConnections = append(appInstance.PoolConnections, poolConn)
-			}
-		}
+		// Initialize pool connections in parallel groups of 10
+		appInstance.PoolConnections = createPoolConnectionsParallel(poolInit, appInstance.PeerHost, appInstance.PeerPort, ping, sshUser, sshKeyPath, appInstance.SSHPort)
 
 		log.Debugf("Created %d pool connections", len(appInstance.PoolConnections))
 	} else {
@@ -133,11 +128,27 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 		Timeout:         10 * time.Second,
 	}
 
-	// Connect to SSH server
-	sshConn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, sshPort), config)
-	if err != nil {
-		log.Errorf("Error connecting to SSH server %s:%d for connection %d: %v", host, sshPort, id, err)
-		return nil
+	// Connect to SSH server with retry logic
+	var sshConn *ssh.Client
+	maxRetries := 3
+	retryDelay := 100 * time.Millisecond
+
+	for retry := 0; retry < maxRetries; retry++ {
+		sshConn, err = ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, sshPort), config)
+		if err == nil {
+			break // Success
+		}
+
+		if retry < maxRetries-1 {
+			log.Debugf("SSH connection attempt %d failed for connection %d, retrying in %v: %v",
+				retry+1, id, retryDelay, err)
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+		} else {
+			log.Errorf("Error connecting to SSH server %s:%d for connection %d after %d attempts: %v",
+				host, sshPort, id, maxRetries, err)
+			return nil
+		}
 	}
 
 	// Create local port forward
@@ -185,6 +196,85 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 
 	log.Infof("SSH tunnel connection %d established: direct tunnel -> %s@%s:%d (protobuf port %d)", id, sshUser, host, sshPort, port)
 	return poolConn
+}
+
+// createPoolConnectionsParallel creates pool connections in parallel groups to speed up initialization
+func createPoolConnectionsParallel(poolInit int, host string, port int, ping bool, sshUser string, sshKeyPath string, sshPort int) []*PoolConnection {
+	if poolInit <= 0 {
+		return []*PoolConnection{}
+	}
+
+	const groupSize = 3                           // Smaller groups to avoid overwhelming SSH server
+	const connectionDelay = 50 * time.Millisecond // Small delay between connections in a group
+	const groupDelay = 200 * time.Millisecond     // Delay between groups
+	var allConnections []*PoolConnection
+	var mutex sync.Mutex
+	var wg sync.WaitGroup
+
+	log.Debugf("Creating %d pool connections in parallel groups of %d with rate limiting", poolInit, groupSize)
+
+	// Process connections in smaller groups with delays
+	for startIdx := 0; startIdx < poolInit; startIdx += groupSize {
+		endIdx := startIdx + groupSize
+		if endIdx > poolInit {
+			endIdx = poolInit
+		}
+
+		// Create a group of connections with controlled parallelism
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+
+			var groupConnections []*PoolConnection
+			var groupWg sync.WaitGroup
+
+			// Create each connection in this group with small delays
+			for i := start; i < end; i++ {
+				groupWg.Add(1)
+				go func(connID int) {
+					defer groupWg.Done()
+
+					// Add a small random delay to stagger connections
+					if connID > start {
+						time.Sleep(time.Duration(connID-start) * connectionDelay)
+					}
+
+					log.Tracef("Creating pool connection %d in parallel", connID)
+					poolConn := createPoolConnection(uint64(connID), host, port, ping, sshUser, sshKeyPath, sshPort)
+
+					if poolConn != nil {
+						mutex.Lock()
+						groupConnections = append(groupConnections, poolConn)
+						mutex.Unlock()
+						log.Tracef("Pool connection %d created successfully", connID)
+					} else {
+						log.Warnf("Failed to create pool connection %d", connID)
+					}
+				}(i)
+			}
+
+			// Wait for all connections in this group to complete
+			groupWg.Wait()
+
+			// Add group connections to the main list
+			mutex.Lock()
+			allConnections = append(allConnections, groupConnections...)
+			mutex.Unlock()
+
+			log.Debugf("Completed group of %d connections (IDs %d-%d)", end-start, start, end-1)
+		}(startIdx, endIdx)
+
+		// Add delay between groups to avoid overwhelming the server
+		if startIdx+groupSize < poolInit {
+			time.Sleep(groupDelay)
+		}
+	}
+
+	// Wait for all groups to complete
+	wg.Wait()
+
+	log.Infof("Parallel pool creation completed: %d connections created out of %d requested", len(allConnections), poolInit)
+	return allConnections
 }
 
 func poolConnectionSender(poolConn *PoolConnection) {
