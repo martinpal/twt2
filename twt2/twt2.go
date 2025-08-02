@@ -395,6 +395,12 @@ func handleConnection(conn net.Conn) {
 }
 
 func handleProxycommMessage(message *twtproto.ProxyComm) {
+	// Check if app is initialized to prevent race condition crashes
+	if app == nil {
+		log.Warnf("Received message before app initialization, ignoring: %v", message.Mt)
+		return
+	}
+
 	// Marshal message back to show hexdump
 	data, err := proto.Marshal(message)
 	if err != nil {
