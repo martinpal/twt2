@@ -395,7 +395,13 @@ func handleConnection(conn net.Conn) {
 }
 
 func handleProxycommMessage(message *twtproto.ProxyComm) {
-	log.Tracef("Received message: %v", message)
+	// Marshal message back to show hexdump
+	data, err := proto.Marshal(message)
+	if err != nil {
+		log.Tracef("Received message: %v", message)
+	} else {
+		log.Tracef("Received message hexdump length(%d): %s", len(data), hex.Dump(data))
+	}
 	if message.Mt == twtproto.ProxyComm_PING {
 		log.Debugf("Received PING message from proxy %d", message.Proxy)
 		return
@@ -493,7 +499,7 @@ func newConnection(message *twtproto.ProxyComm) {
 	conn, err := net.Dial("tcp", net.JoinHostPort(message.Address, strconv.Itoa(int(message.Port))))
 	if err != nil {
 		log.Errorf("Failed to connect to %s:%d for connection %d: %v", message.Address, message.Port, message.Connection, err)
-		
+
 		// Send close connection message back to client to inform of failure
 		closeMessage := &twtproto.ProxyComm{
 			Mt:         twtproto.ProxyComm_CLOSE_CONN_C,
