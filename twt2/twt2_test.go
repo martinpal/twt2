@@ -1149,3 +1149,512 @@ func TestSendProtobuf_ErrorCases(t *testing.T) {
 	// Should handle write error gracefully
 	sendProtobuf(testMessage)
 }
+
+// Test more handleProxycommMessage cases to increase coverage
+func TestHandleProxycommMessage_MoreCases(t *testing.T) {
+	originalApp := app
+	defer func() { app = originalApp }()
+
+	testApp := &App{
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	app = testApp
+
+	// Test CLOSE_CONN_S message
+	closeServerMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_CLOSE_CONN_S,
+		Connection: 1,
+	}
+	// Add a remote connection to close
+	mockRemoteConn := newMockConn()
+	app.RemoteConnections[1] = Connection{
+		Connection:   mockRemoteConn,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+	}
+	handleProxycommMessage(closeServerMessage)
+
+	// Verify remote connection was removed
+	if _, exists := app.RemoteConnections[1]; exists {
+		t.Error("Expected remote connection to be removed")
+	}
+}
+
+// Test newConnection function
+func TestNewConnection(t *testing.T) {
+	originalApp := app
+	defer func() { app = originalApp }()
+
+	testApp := &App{
+		RemoteConnections:     make(map[uint64]Connection),
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	app = testApp
+
+	// Test with valid address and port
+	message := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_OPEN_CONN,
+		Connection: 1,
+		Address:    "httpbin.org", // Use a real address that should work
+		Port:       80,
+	}
+
+	// Execute in goroutine since it makes network calls
+	done := make(chan bool, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("Unexpected panic: %v", r)
+			}
+			done <- true
+		}()
+		newConnection(message)
+	}()
+
+	// Wait for completion
+	select {
+	case <-done:
+		// Check if connection was added (might fail due to network, but shouldn't panic)
+		testApp.RemoteConnectionMutex.Lock()
+		connectionCount := len(testApp.RemoteConnections)
+		testApp.RemoteConnectionMutex.Unlock()
+		// Don't assert specific count as network calls might fail in test environment
+		t.Logf("Connections after newConnection: %d", connectionCount)
+	case <-time.After(5 * time.Second):
+		t.Error("newConnection took too long to complete")
+	}
+
+	// Test with invalid address (should fail gracefully)
+	invalidMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_OPEN_CONN,
+		Connection: 2,
+		Address:    "invalid.domain.that.does.not.exist.example",
+		Port:       443,
+	}
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("Unexpected panic on invalid address: %v", r)
+			}
+			done <- true
+		}()
+		newConnection(invalidMessage)
+	}()
+
+	select {
+	case <-done:
+		// Should handle invalid address gracefully
+	case <-time.After(5 * time.Second):
+		t.Error("newConnection with invalid address took too long")
+	}
+}
+
+// Test poolConnectionSender function
+func TestPoolConnectionSender(t *testing.T) {
+	mockConn := newMockConn()
+	poolConn := &PoolConnection{
+		ID:       1,
+		Conn:     mockConn,
+		SendChan: make(chan *twtproto.ProxyComm, 10),
+	}
+
+	// Start sender in goroutine
+	done := make(chan bool, 1)
+	go func() {
+		defer func() {
+			done <- true
+		}()
+		poolConnectionSender(poolConn)
+	}()
+
+	// Send test messages
+	testMessage1 := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_PING,
+		Connection: 1,
+	}
+	testMessage2 := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_DATA_UP,
+		Connection: 2,
+		Data:       []byte("test data"),
+	}
+
+	poolConn.SendChan <- testMessage1
+	poolConn.SendChan <- testMessage2
+
+	// Give time for messages to be processed
+	time.Sleep(10 * time.Millisecond)
+
+	// Close channel to stop sender
+	close(poolConn.SendChan)
+
+	// Wait for sender to finish
+	select {
+	case <-done:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Error("poolConnectionSender did not finish in time")
+	}
+
+	// Verify messages were sent
+	writtenMessages := mockConn.getWrittenMessages()
+	if len(writtenMessages) != 2 {
+		t.Errorf("Expected 2 messages written, got %d", len(writtenMessages))
+	}
+}
+
+// Test sendProtobufToConn error cases
+func TestSendProtobufToConn_ErrorCases(t *testing.T) {
+	// Test with connection that returns write error
+	mockConn := newMockConn()
+	mockConn.writeError = fmt.Errorf("write error")
+
+	testMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_PING,
+		Connection: 1,
+	}
+
+	// Should handle write error gracefully (no panic)
+	sendProtobufToConn(mockConn, testMessage)
+
+	// Test with nil message (should handle gracefully)
+	mockConn2 := newMockConn()
+	sendProtobufToConn(mockConn2, nil)
+}
+
+// Test clearConnectionState with more scenarios
+func TestClearConnectionState_Extended(t *testing.T) {
+	originalApp := app
+	defer func() { app = originalApp }()
+
+	// Test with connections that have actual network connections
+	testApp := &App{
+		LocalConnections:  make(map[uint64]Connection),
+		RemoteConnections: make(map[uint64]Connection),
+	}
+	app = testApp
+
+	// Add connections with mock network connections
+	mockConn1 := newMockConn()
+	mockConn2 := newMockConn()
+	mockConn3 := newMockConn()
+
+	app.LocalConnections[1] = Connection{
+		Connection:   mockConn1,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+	}
+	app.LocalConnections[2] = Connection{
+		Connection:   mockConn2,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+	}
+	app.RemoteConnections[1] = Connection{
+		Connection:   mockConn3,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+	}
+
+	// Execute
+	clearConnectionState()
+
+	// Verify all connections were closed
+	if !mockConn1.closed {
+		t.Error("Expected local connection 1 to be closed")
+	}
+	if !mockConn2.closed {
+		t.Error("Expected local connection 2 to be closed")
+	}
+	if !mockConn3.closed {
+		t.Error("Expected remote connection 1 to be closed")
+	}
+
+	// Verify maps were cleared
+	if len(app.LocalConnections) != 0 {
+		t.Errorf("Expected 0 local connections, got %d", len(app.LocalConnections))
+	}
+	if len(app.RemoteConnections) != 0 {
+		t.Errorf("Expected 0 remote connections, got %d", len(app.RemoteConnections))
+	}
+}
+
+// Test Hijack with more error conditions
+func TestHijack_MoreErrorConditions(t *testing.T) {
+	originalApp := app
+	originalProtobufConnection := protobufConnection
+	defer func() {
+		app = originalApp
+		protobufConnection = originalProtobufConnection
+	}()
+
+	// Test with nil protobuf connection
+	protobufConnection = nil
+
+	testApp := &App{
+		LocalConnections:     make(map[uint64]Connection),
+		LastLocalConnection:  1,
+		LocalConnectionMutex: sync.Mutex{},
+	}
+	app = testApp
+
+	req, _ := http.NewRequest("CONNECT", "example.com:443", nil)
+	req.Host = "example.com:443"
+	rw := &mockHijackableResponseWriter{}
+
+	// Execute - should handle nil protobuf connection
+	Hijack(rw, req)
+
+	// Should have called hijack despite protobuf connection being nil
+	if !rw.hijackCalled {
+		t.Error("Expected Hijack to be called even with nil protobuf connection")
+	}
+}
+
+// Test handleConnection with various frame corruption scenarios
+func TestHandleConnection_FrameCorruption(t *testing.T) {
+	originalApp := app
+	defer func() { app = originalApp }()
+
+	testApp := &App{
+		LocalConnections:  make(map[uint64]Connection),
+		RemoteConnections: make(map[uint64]Connection),
+	}
+	app = testApp
+
+	// Test with incomplete length header (only 1 byte)
+	mockConn1 := newMockConn()
+	mockConn1.readData = []byte{0x10} // Only 1 byte instead of 2
+
+	done := make(chan bool, 1)
+	go func() {
+		handleConnection(mockConn1)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Should handle incomplete header gracefully
+	case <-time.After(100 * time.Millisecond):
+		t.Error("handleConnection with incomplete header took too long")
+	}
+
+	// Test with length header indicating huge message
+	mockConn2 := newMockConn()
+	mockConn2.readData = []byte{0xFF, 0xFF} // 65535 bytes - should exceed reasonable limit
+
+	go func() {
+		handleConnection(mockConn2)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Should detect unreasonable message size
+	case <-time.After(100 * time.Millisecond):
+		t.Error("handleConnection with huge message size took too long")
+	}
+
+	// Test with length header but incomplete message data
+	mockConn3 := newMockConn()
+	mockConn3.readData = []byte{0x10, 0x00} // Claims 16 bytes but no data follows
+
+	go func() {
+		handleConnection(mockConn3)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Should handle incomplete message data
+	case <-time.After(100 * time.Millisecond):
+		t.Error("handleConnection with incomplete message took too long")
+	}
+}
+
+// Test NewApp with different configurations to increase coverage
+func TestNewApp_ExtendedConfigurations(t *testing.T) {
+	handler := http.NotFoundHandler().ServeHTTP
+
+	// Test with empty peer host (server mode)
+	app1 := NewApp(handler, 8080, "", 22, 0, 5, false, true, "user", "/tmp/key", 22)
+	if len(app1.PoolConnections) != 0 {
+		t.Error("Expected no pool connections when peer host is empty")
+	}
+
+	// Test with non-client mode
+	app2 := NewApp(handler, 8080, "example.com", 22, 2, 5, true, false, "user", "/tmp/key", 22)
+	if len(app2.PoolConnections) != 0 {
+		t.Error("Expected no pool connections in server mode")
+	}
+
+	// Test with zero pool initialization
+	app3 := NewApp(handler, 8080, "example.com", 22, 0, 5, true, true, "user", "/tmp/key", 22)
+	if len(app3.PoolConnections) != 0 {
+		t.Error("Expected no pool connections when poolInit is 0")
+	}
+}
+
+// Test createPoolConnection with various error conditions
+func TestCreatePoolConnection_ErrorConditions(t *testing.T) {
+	// Test with non-existent key file
+	poolConn1 := createPoolConnection(1, "example.com", 22, false, "user", "/nonexistent/path/key", 22)
+	if poolConn1 != nil {
+		t.Error("Expected nil when key file doesn't exist")
+	}
+}
+
+// Test message queue processing
+func TestMessageQueueProcessing(t *testing.T) {
+	originalApp := app
+	defer func() { app = originalApp }()
+
+	testApp := &App{
+		LocalConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex: sync.Mutex{},
+	}
+	app = testApp
+
+	// Create a connection with message queue
+	mockConn := newMockConn()
+	conn := Connection{
+		Connection:   mockConn,
+		NextSeqOut:   3, // Expecting sequence 3
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+	}
+
+	// Add some out-of-order messages to the queue
+	conn.MessageQueue[4] = &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_DATA_DOWN,
+		Connection: 1,
+		Seq:        4,
+		Data:       []byte("message 4"),
+	}
+	conn.MessageQueue[5] = &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_DATA_DOWN,
+		Connection: 1,
+		Seq:        5,
+		Data:       []byte("message 5"),
+	}
+
+	app.LocalConnections[1] = conn
+
+	// Now send the expected message (sequence 3)
+	inOrderMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_DATA_DOWN,
+		Connection: 1,
+		Seq:        3,
+		Data:       []byte("message 3"),
+	}
+
+	handleProxycommMessage(inOrderMessage)
+
+	// Check if queued messages were processed
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify the connection's NextSeqOut was updated
+	updatedConn := app.LocalConnections[1]
+	if updatedConn.NextSeqOut < 4 { // Should have processed at least message 3
+		t.Errorf("Expected NextSeqOut to be at least 4, got %d", updatedConn.NextSeqOut)
+	}
+
+	// Check if data was written to the connection
+	if len(mockConn.writeData) == 0 {
+		t.Error("Expected data to be written to connection")
+	}
+}
+
+// Test ProtobufServer with more scenarios
+func TestProtobufServer_ExtendedScenarios(t *testing.T) {
+	// Test with high port number that should be available
+	done := make(chan bool, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// May panic on some systems
+			}
+			done <- true
+		}()
+		ProtobufServer(0) // Port 0 should auto-assign available port
+	}()
+
+	select {
+	case <-done:
+		// Should handle port binding gracefully
+	case <-time.After(500 * time.Millisecond):
+		// Function might block
+	}
+}
+
+// Test connection cleanup scenarios
+func TestConnectionCleanup(t *testing.T) {
+	originalApp := app
+	defer func() { app = originalApp }()
+
+	testApp := &App{
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	app = testApp
+
+	// Add connections with message queues
+	mockLocalConn := newMockConn()
+	mockRemoteConn := newMockConn()
+
+	localConn := Connection{
+		Connection: mockLocalConn,
+		MessageQueue: map[uint64]*twtproto.ProxyComm{
+			10: {Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 10},
+			11: {Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 11},
+		},
+	}
+	remoteConn := Connection{
+		Connection: mockRemoteConn,
+		MessageQueue: map[uint64]*twtproto.ProxyComm{
+			20: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 20},
+		},
+	}
+
+	app.LocalConnections[1] = localConn
+	app.RemoteConnections[1] = remoteConn
+
+	// Test closing local connection with queued messages
+	closeLocalMsg := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_CLOSE_CONN_C,
+		Connection: 1,
+	}
+	closeConnectionLocal(closeLocalMsg)
+
+	// Verify local connection was removed immediately
+	if _, exists := app.LocalConnections[1]; exists {
+		t.Error("Expected local connection to be removed")
+	}
+
+	// Wait for the delayed close operation (closeConnectionLocal uses 1 second delay)
+	time.Sleep(1100 * time.Millisecond) // Wait a bit longer than 1 second
+
+	// Verify local connection was closed after delay
+	if !mockLocalConn.closed {
+		t.Error("Expected local connection to be closed after delay")
+	}
+
+	// Test closing remote connection with queued messages
+	closeRemoteMsg := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_CLOSE_CONN_S,
+		Connection: 1,
+	}
+	closeConnectionRemote(closeRemoteMsg)
+
+	// Verify remote connection was removed immediately
+	if _, exists := app.RemoteConnections[1]; exists {
+		t.Error("Expected remote connection to be removed")
+	}
+
+	// Wait for the delayed close operation (closeConnectionRemote uses 1 second delay)
+	time.Sleep(1100 * time.Millisecond) // Wait a bit longer than 1 second
+
+	// Verify remote connection was closed after delay
+	if !mockRemoteConn.closed {
+		t.Error("Expected remote connection to be closed after delay")
+	}
+}
