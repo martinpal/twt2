@@ -150,7 +150,7 @@ func main() {
 	}
 
 	// Create app instance
-	twt2.NewApp(twt2.Hijack, *listenPort, sshHost, sshPortInt, *poolInit, *poolCap, *pingPool, isClient, sshUser, *sshKeyPath, sshPortInt)
+	twt2.NewApp(twt2.Hijack, *listenPort, sshHost, *listenPort, *poolInit, *poolCap, *pingPool, isClient, sshUser, *sshKeyPath, sshPortInt)
 	defer func() {
 		// Cleanup pool connections and SSH tunnels (only relevant for client mode)
 		if twt2.GetApp() != nil {
