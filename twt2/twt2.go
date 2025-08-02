@@ -777,8 +777,3 @@ func ProtobufServer(listenPort int) {
 		go handleConnection(conn)
 	}
 }
-
-// FIXME Delete this!
-func tf(a int) int {
-	return 2 * a
-}
