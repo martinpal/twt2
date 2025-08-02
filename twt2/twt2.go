@@ -492,7 +492,16 @@ func newConnection(message *twtproto.ProxyComm) {
 	log.Infof("Openning connection %4d to %s:%d", message.Connection, message.Address, message.Port)
 	conn, err := net.Dial("tcp", net.JoinHostPort(message.Address, strconv.Itoa(int(message.Port))))
 	if err != nil {
-		log.Fatal(err)
+		log.Errorf("Failed to connect to %s:%d for connection %d: %v", message.Address, message.Port, message.Connection, err)
+		
+		// Send close connection message back to client to inform of failure
+		closeMessage := &twtproto.ProxyComm{
+			Mt:         twtproto.ProxyComm_CLOSE_CONN_C,
+			Proxy:      proxyID,
+			Connection: message.Connection,
+			Seq:        0,
+		}
+		sendProtobuf(closeMessage)
 		return
 	}
 	thisConnection, ok := app.RemoteConnections[message.Connection]
