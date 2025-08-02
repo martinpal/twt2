@@ -293,6 +293,20 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 }
 
 func sendProtobuf(message *twtproto.ProxyComm) {
+	// Check if we're in server mode (no pool connections)
+	if len(app.PoolConnections) == 0 {
+		// Server mode - send directly through the protobuf connection
+		if protobufConnection != nil {
+			log.Tracef("Sending message via direct protobuf connection (server mode)")
+			sendProtobufToConn(protobufConnection, message)
+			return
+		} else {
+			log.Errorf("No protobuf connection available for server response")
+			return
+		}
+	}
+
+	// Client mode - use pool connections
 	app.PoolMutex.Lock()
 	defer app.PoolMutex.Unlock()
 
@@ -334,10 +348,15 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 // protobuf server
 
+var protobufConnection net.Conn // Global variable to store the protobuf connection for server responses
+
 func handleConnection(conn net.Conn) {
+	// Store the connection for server responses
+	protobufConnection = conn
+
 	for {
 		l := make([]byte, 2)
-		n, err := conn.Read(l)
+		_, err := conn.Read(l)
 		if err != nil {
 			log.Infof("Error reading frame length: %v", err)
 			return
@@ -347,7 +366,7 @@ func handleConnection(conn net.Conn) {
 		B := make([]byte, 0, length)
 		b := make([]byte, length)
 		for len(B) != length {
-			n, err = conn.Read(b)
+			n, err := conn.Read(b)
 			if err != nil {
 				log.Infof("Error reading data: %v", err)
 				if err != io.EOF {
@@ -414,7 +433,7 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 		if !ok {
 			log.Tracef("No such connection %d, seq %d, adding", message.Connection, message.Seq)
 			app.RemoteConnections[message.Connection] = Connection{Connection: nil, LastSeqIn: 0, NextSeqOut: 0, MessageQueue: make(map[uint64]*twtproto.ProxyComm)}
-			thisConnection, _ = app.RemoteConnections[message.Connection]
+			thisConnection = app.RemoteConnections[message.Connection]
 		}
 		log.Tracef("Seq UP %d %d", message.Seq, thisConnection.NextSeqOut)
 		if message.Seq != thisConnection.NextSeqOut {
