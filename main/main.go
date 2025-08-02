@@ -56,9 +56,6 @@ func stats() {
 }
 
 func main() {
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
 	// log.SetFormatter(&log.JSONFormatter{})
 	log.SetReportCaller(true)
 	log.SetFormatter(&log.TextFormatter{
@@ -82,6 +79,17 @@ func main() {
 
 	// Determine if this is client or server mode
 	isClient := !*serverMode
+
+	// Start HTTP profiling server on different ports for client/server
+	go func() {
+		var profilePort string
+		if isClient {
+			profilePort = "localhost:6060"
+		} else {
+			profilePort = "localhost:6061"
+		}
+		log.Println(http.ListenAndServe(profilePort, nil))
+	}()
 
 	// Parse SSH server specification for client mode
 	var sshUser, sshHost string

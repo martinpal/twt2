@@ -210,7 +210,7 @@ Options:
 
 The application includes built-in monitoring and statistics:
 
-- **HTTP Profiling**: Available at `localhost:6060` for performance analysis
+- **HTTP Profiling**: Available at `localhost:6060` (client mode) or `localhost:6061` (server mode) for performance analysis
 - **Connection Statistics**: Logged every 5 seconds showing pool and connection counts
 - **Detailed Logging**: Multiple log levels for troubleshooting
 
