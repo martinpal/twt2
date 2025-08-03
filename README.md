@@ -206,6 +206,116 @@ Options:
      -ssh-user $USER -ssh-key ~/.ssh/id_rsa
 ```
 
+## TWT2 Proxy Authentication
+
+TWT2 now supports HTTP Basic Authentication for proxy access control.
+
+### Features
+
+- **HTTP Basic Authentication**: Industry-standard authentication mechanism
+- **Secure Credential Comparison**: Uses constant-time comparison to prevent timing attacks
+- **Client-side Only**: Authentication is only active in client mode (HTTP proxy)
+- **Standard Compliance**: Follows RFC 7617 for HTTP Basic Authentication
+
+### Usage
+
+#### Enabling Authentication
+
+To enable proxy authentication, provide both username and password when starting TWT2 in client mode:
+
+```bash
+./twt2main -proxy-user myuser -proxy-pass mypassword [other options...]
+```
+
+#### Client Configuration
+
+Clients connecting to your authenticated proxy need to provide credentials:
+
+##### curl Example
+```bash
+curl --proxy-user myuser:mypassword --proxy http://localhost:3128 https://example.com
+```
+
+##### Browser Configuration
+Most browsers allow you to configure authenticated proxies:
+- URL: `http://localhost:3128`
+- Username: `myuser`
+- Password: `mypassword`
+
+##### Programming Example (Python)
+```python
+import requests
+
+proxies = {
+    'http': 'http://myuser:mypassword@localhost:3128',
+    'https': 'http://myuser:mypassword@localhost:3128'
+}
+
+response = requests.get('https://example.com', proxies=proxies)
+```
+
+### Command Line Options
+
+- `-proxy-user <username>`: Username for proxy authentication (client mode only)
+- `-proxy-pass <password>`: Password for proxy authentication (client mode only)
+
+**Note**: Both options must be provided together. If only one is specified, TWT2 will exit with an error.
+
+### Security Considerations
+
+1. **Credential Storage**: Avoid hardcoding credentials. Consider using environment variables or configuration files.
+
+2. **Command Line Visibility**: Be aware that command-line arguments may be visible to other users on the system via `ps` command.
+
+3. **Transport Security**: While proxy authentication is encrypted when used with HTTPS, consider additional security measures for sensitive environments.
+
+4. **Strong Passwords**: Use strong, unique passwords for proxy authentication.
+
+### Authentication Flow
+
+1. Client sends HTTP CONNECT request to proxy
+2. TWT2 checks for `Proxy-Authorization: Basic <base64-credentials>` header
+3. If authentication is enabled and credentials are missing/invalid:
+   - Returns `407 Proxy Authentication Required`
+   - Includes `Proxy-Authenticate: Basic realm="TWT2 Proxy"` header
+4. If credentials are valid, proxy connection proceeds normally
+
+### Example Complete Setup
+
+#### Server Side (Remote)
+```bash
+./twt2main -server -L 2 -b 33333
+```
+
+#### Client Side (Local) with Authentication
+```bash
+./twt2main -L 2 -h remote-server.com -p 33333 -l 3128 -b 33334 \
+     -ssh-user tunneluser -ssh-key ~/.ssh/id_rsa \
+     -proxy-user proxyuser -proxy-pass securepassword123
+```
+
+#### Client Application
+```bash
+curl --proxy-user proxyuser:securepassword123 \
+     --proxy http://localhost:3128 \
+     https://httpbin.org/ip
+```
+
+### Troubleshooting
+
+#### Authentication Failed
+- Check username and password are correct
+- Ensure both `-proxy-user` and `-proxy-pass` are provided
+- Verify client is sending proper `Proxy-Authorization` header
+
+#### No Authentication Required
+- If no credentials are configured, TWT2 operates without authentication
+- Authentication is ignored in server mode
+
+#### Log Messages
+- Successful authentication: `Proxy authentication successful for <host> from <ip>`
+- Failed authentication: `Proxy authentication failed for <host> from <ip>`
+
 ## Monitoring
 
 The application includes built-in monitoring and statistics:

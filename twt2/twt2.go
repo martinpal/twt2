@@ -2,6 +2,8 @@ package twt2
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -65,13 +67,17 @@ type App struct {
 	LocalConnections      map[uint64]Connection
 	RemoteConnectionMutex sync.Mutex
 	RemoteConnections     map[uint64]Connection
+	// Proxy authentication
+	ProxyAuthEnabled bool
+	ProxyUsername    string
+	ProxyPassword    string
 }
 
 func GetApp() *App {
 	return app
 }
 
-func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int) *App {
+func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int, proxyAuthEnabled bool, proxyUsername string, proxyPassword string) *App {
 	appInstance := &App{
 		ListenPort:        listenPort,
 		PeerHost:          peerHost,
@@ -85,6 +91,9 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 		PoolSize:          poolCap,
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
+		ProxyAuthEnabled:  proxyAuthEnabled,
+		ProxyUsername:     proxyUsername,
+		ProxyPassword:     proxyPassword,
 	}
 
 	// Only create pool connections on client side
@@ -490,7 +499,61 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.DefaultRoute(w, r)
 }
 
+// authenticateProxyRequest checks if the request has valid proxy authentication
+func authenticateProxyRequest(r *http.Request, username, password string) bool {
+	if username == "" && password == "" {
+		return true // No authentication required
+	}
+
+	// Get the Proxy-Authorization header
+	proxyAuth := r.Header.Get("Proxy-Authorization")
+	if proxyAuth == "" {
+		return false
+	}
+
+	// Check if it's Basic authentication
+	if !strings.HasPrefix(proxyAuth, "Basic ") {
+		return false
+	}
+
+	// Decode the base64 credentials
+	encoded := strings.TrimPrefix(proxyAuth, "Basic ")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return false
+	}
+
+	// Split username:password
+	credentials := strings.SplitN(string(decoded), ":", 2)
+	if len(credentials) != 2 {
+		return false
+	}
+
+	// Use constant-time comparison to prevent timing attacks
+	usernameMatch := subtle.ConstantTimeCompare([]byte(credentials[0]), []byte(username)) == 1
+	passwordMatch := subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(password)) == 1
+
+	return usernameMatch && passwordMatch
+}
+
+// sendProxyAuthRequired sends a 407 Proxy Authentication Required response
+func sendProxyAuthRequired(w http.ResponseWriter) {
+	w.Header().Set("Proxy-Authenticate", "Basic realm=\"TW2 Proxy\"")
+	w.WriteHeader(http.StatusProxyAuthRequired)
+	w.Write([]byte("Proxy Authentication Required"))
+}
+
 func Hijack(w http.ResponseWriter, r *http.Request) {
+	// Check proxy authentication if enabled
+	if app.ProxyAuthEnabled {
+		if !authenticateProxyRequest(r, app.ProxyUsername, app.ProxyPassword) {
+			log.Warnf("Proxy authentication failed for %s from %s", r.Host, r.RemoteAddr)
+			sendProxyAuthRequired(w)
+			return
+		}
+		log.Tracef("Proxy authentication successful for %s from %s", r.Host, r.RemoteAddr)
+	}
+
 	parsedHost := strings.Split(r.Host, ":")
 	host := parsedHost[0]
 	port, _ := strconv.Atoi(parsedHost[1])

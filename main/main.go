@@ -74,6 +74,8 @@ func main() {
 	serverMode := flag.Bool("server", false, "Run in server mode (only ProtoBuf server, no HTTP proxy)")
 	sshServer := flag.String("ssh", "", "SSH server specification in format user@host[:sshport] (client mode only, defaults to port 22)")
 	sshKeyPath := flag.String("ssh-key", "", "Path to SSH private key file (client mode only)")
+	proxyUser := flag.String("proxy-user", "", "Username for proxy authentication (client mode only)")
+	proxyPass := flag.String("proxy-pass", "", "Password for proxy authentication (client mode only)")
 	flag.Parse()
 	setLogLevel(logLevel)
 
@@ -149,8 +151,20 @@ func main() {
 		}
 	}
 
+	// Determine authentication settings
+	proxyAuthEnabled := *proxyUser != "" || *proxyPass != ""
+	if proxyAuthEnabled && isClient {
+		if *proxyUser == "" || *proxyPass == "" {
+			log.Fatal("Both -proxy-user and -proxy-pass must be provided for proxy authentication")
+		}
+		log.Infof("Proxy authentication enabled for user: %s", *proxyUser)
+	} else if proxyAuthEnabled && !isClient {
+		log.Warn("Proxy authentication settings ignored in server mode")
+		proxyAuthEnabled = false
+	}
+
 	// Create app instance
-	twt2.NewApp(twt2.Hijack, *listenPort, sshHost, *listenPort, *poolInit, *poolCap, *pingPool, isClient, sshUser, *sshKeyPath, sshPortInt)
+	twt2.NewApp(twt2.Hijack, *listenPort, sshHost, *listenPort, *poolInit, *poolCap, *pingPool, isClient, sshUser, *sshKeyPath, sshPortInt, proxyAuthEnabled, *proxyUser, *proxyPass)
 	defer func() {
 		// Cleanup pool connections and SSH tunnels (only relevant for client mode)
 		if twt2.GetApp() != nil {
