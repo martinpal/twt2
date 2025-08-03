@@ -76,6 +76,7 @@ func main() {
 	sshKeyPath := flag.String("ssh-key", "", "Path to SSH private key file (client mode only)")
 	proxyUser := flag.String("proxy-user", "", "Username for proxy authentication (client mode only)")
 	proxyPass := flag.String("proxy-pass", "", "Password for proxy authentication (client mode only)")
+	pacFile := flag.String("pac-file", "", "Path to PAC (Proxy Auto-Configuration) file (client mode only, optional)")
 	flag.Parse()
 	setLogLevel(logLevel)
 
@@ -163,8 +164,16 @@ func main() {
 		proxyAuthEnabled = false
 	}
 
+	// PAC file configuration
+	if *pacFile != "" && isClient {
+		log.Infof("PAC file configured: %s", *pacFile)
+	} else if *pacFile != "" && !isClient {
+		log.Warn("PAC file setting ignored in server mode")
+		*pacFile = ""
+	}
+
 	// Create app instance
-	twt2.NewApp(twt2.Hijack, *listenPort, sshHost, *listenPort, *poolInit, *poolCap, *pingPool, isClient, sshUser, *sshKeyPath, sshPortInt, proxyAuthEnabled, *proxyUser, *proxyPass)
+	twt2.NewApp(twt2.Hijack, *listenPort, sshHost, *listenPort, *poolInit, *poolCap, *pingPool, isClient, sshUser, *sshKeyPath, sshPortInt, proxyAuthEnabled, *proxyUser, *proxyPass, *pacFile)
 	defer func() {
 		// Cleanup pool connections and SSH tunnels (only relevant for client mode)
 		if twt2.GetApp() != nil {

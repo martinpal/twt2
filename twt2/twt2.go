@@ -71,13 +71,15 @@ type App struct {
 	ProxyAuthEnabled bool
 	ProxyUsername    string
 	ProxyPassword    string
+	// PAC file configuration
+	PACFilePath string
 }
 
 func GetApp() *App {
 	return app
 }
 
-func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int, proxyAuthEnabled bool, proxyUsername string, proxyPassword string) *App {
+func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int, proxyAuthEnabled bool, proxyUsername string, proxyPassword string, pacFilePath string) *App {
 	appInstance := &App{
 		ListenPort:        listenPort,
 		PeerHost:          peerHost,
@@ -94,6 +96,7 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 		ProxyAuthEnabled:  proxyAuthEnabled,
 		ProxyUsername:     proxyUsername,
 		ProxyPassword:     proxyPassword,
+		PACFilePath:       pacFilePath,
 	}
 
 	// Only create pool connections on client side
@@ -543,7 +546,63 @@ func sendProxyAuthRequired(w http.ResponseWriter) {
 	w.Write([]byte("Proxy Authentication Required"))
 }
 
+// servePACFile serves the PAC (Proxy Auto-Configuration) file
+func servePACFile(w http.ResponseWriter, r *http.Request) {
+	log.Infof("Serving PAC file request from %s", r.RemoteAddr)
+
+	var pacContent []byte
+	var err error
+
+	if app.PACFilePath != "" {
+		// Read PAC file from disk
+		pacContent, err = os.ReadFile(app.PACFilePath)
+		if err != nil {
+			log.Errorf("Error reading PAC file %s: %v", app.PACFilePath, err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		} else {
+			log.Debugf("Successfully read PAC file from %s", app.PACFilePath)
+		}
+	}
+
+	// Set appropriate headers for PAC file
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	w.Header().Set("Content-Length", strconv.Itoa(len(pacContent)))
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(pacContent)
+}
+
+// handleHTTPRequest handles HTTP requests (non-CONNECT) including PAC file requests
+func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a PAC file request
+	if r.Method == "GET" && (r.URL.Path == "/proxy.pac" || r.URL.Path == "/wpad.dat") {
+		servePACFile(w, r)
+		return
+	}
+
+	// For other HTTP requests, return a simple response
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("TW2\n"))
+}
+
 func Hijack(w http.ResponseWriter, r *http.Request) {
+	// Handle GET requests (including PAC file requests)
+	if r.Method == "GET" {
+		handleHTTPRequest(w, r)
+		return
+	}
+
+	// Handle CONNECT requests (proxy tunneling)
+	if r.Method != "CONNECT" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	// Check proxy authentication if enabled
 	if app.ProxyAuthEnabled {
 		if !authenticateProxyRequest(r, app.ProxyUsername, app.ProxyPassword) {

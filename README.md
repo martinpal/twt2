@@ -179,6 +179,9 @@ Options:
   -server       Run in server mode (only ProtoBuf server, no HTTP proxy) (default false)
   -ssh-user string   SSH username for tunnel connections (required in client mode)
   -ssh-key string    Path to SSH private key file (required in client mode)
+  -proxy-user string Username for proxy authentication (client mode only)
+  -proxy-pass string Password for proxy authentication (client mode only)
+  -pac-file string   Path to PAC (Proxy Auto-Configuration) file (client mode only, optional)
 ```
 
 ### Basic Usage Examples
@@ -206,9 +209,95 @@ Options:
      -ssh-user $USER -ssh-key ~/.ssh/id_rsa
 ```
 
-## TWT2 Proxy Authentication
+## TW2 PAC (Proxy Auto-Configuration) Support
 
-TWT2 now supports HTTP Basic Authentication for proxy access control.
+TW2 now supports PAC files to automatically configure which websites should use the proxy and which should connect directly.
+
+### Features
+
+- **Automatic PAC file serving**: Serves PAC files via HTTP GET requests
+- **Custom PAC files**: Load PAC configuration from disk via command-line option
+- **Default PAC generation**: Automatically generates PAC content if no file is specified
+- **Standard endpoints**: Supports both `/proxy.pac` and `/wpad.dat` endpoints
+- **Proper HTTP headers**: Sets correct content-type and cache control headers
+
+### Usage
+
+#### Command Line Option
+
+```bash
+./tw2 -pac-file /path/to/proxy.pac [other options...]
+```
+
+#### PAC File Endpoints
+
+Once TW2 is running, browsers can access the PAC file at:
+
+- `http://localhost:3128/proxy.pac` (standard)
+- `http://localhost:3128/wpad.dat` (Web Proxy Auto-Discovery)
+
+#### Browser Configuration
+
+##### Automatic Configuration
+1. Open browser proxy settings
+2. Select "Automatic proxy configuration"
+3. Enter PAC URL: `http://localhost:3128/proxy.pac`
+4. Save settings
+
+##### Manual Browser Setup Examples
+
+**Chrome/Chromium:**
+```bash
+google-chrome --proxy-pac-url=http://localhost:3128/proxy.pac
+```
+
+**Firefox:**
+1. Go to Settings → Network Settings
+2. Select "Automatic proxy configuration URL"
+3. Enter: `http://localhost:3128/proxy.pac`
+
+**curl with PAC:**
+```bash
+curl --proxy-header "Proxy-Connection: Keep-Alive" \
+     --proxy-pac-url http://localhost:3128/proxy.pac \
+     https://server.palecci.cz/
+```
+
+### Security Considerations
+
+1. **PAC File Access**: PAC files are served without authentication to allow browser access
+2. **Content Validation**: Validate PAC file syntax before deployment
+3. **Network Exposure**: Consider firewall rules for PAC file access
+4. **Cache Control**: PAC files are served with no-cache headers for immediate updates
+
+### Troubleshooting
+
+#### PAC File Not Loading
+- Verify file path is correct and readable
+- Check TW2 logs for file reading errors
+- Test PAC endpoint directly with curl
+
+#### Browser Not Using PAC
+- Clear browser cache and restart
+- Check browser proxy settings
+- Verify PAC file syntax
+- Test PAC logic in browser developer tools
+
+#### Authentication Issues
+- PAC file serving bypasses proxy authentication
+- Actual proxy connections still require authentication
+- Configure browser with proxy credentials separately
+
+### Performance Considerations
+
+- PAC files are read from disk on each request for dynamic updates
+- Consider file system caching for high-traffic scenarios
+- Complex PAC logic can impact browser performance
+- Keep PAC rules simple and efficient
+
+## TW2 Proxy Authentication
+
+TW2 supports HTTP Basic Authentication for proxy access control.
 
 ### Features
 
@@ -221,10 +310,10 @@ TWT2 now supports HTTP Basic Authentication for proxy access control.
 
 #### Enabling Authentication
 
-To enable proxy authentication, provide both username and password when starting TWT2 in client mode:
+To enable proxy authentication, provide both username and password when starting TW2 in client mode:
 
 ```bash
-./twt2main -proxy-user myuser -proxy-pass mypassword [other options...]
+./tw2 -proxy-user myuser -proxy-pass mypassword [other options...]
 ```
 
 #### Client Configuration
@@ -259,7 +348,7 @@ response = requests.get('https://example.com', proxies=proxies)
 - `-proxy-user <username>`: Username for proxy authentication (client mode only)
 - `-proxy-pass <password>`: Password for proxy authentication (client mode only)
 
-**Note**: Both options must be provided together. If only one is specified, TWT2 will exit with an error.
+**Note**: Both options must be provided together. If only one is specified, TW2 will exit with an error.
 
 ### Security Considerations
 
@@ -274,22 +363,22 @@ response = requests.get('https://example.com', proxies=proxies)
 ### Authentication Flow
 
 1. Client sends HTTP CONNECT request to proxy
-2. TWT2 checks for `Proxy-Authorization: Basic <base64-credentials>` header
+2. TW2 checks for `Proxy-Authorization: Basic <base64-credentials>` header
 3. If authentication is enabled and credentials are missing/invalid:
    - Returns `407 Proxy Authentication Required`
-   - Includes `Proxy-Authenticate: Basic realm="TWT2 Proxy"` header
+   - Includes `Proxy-Authenticate: Basic realm="TW2 Proxy"` header
 4. If credentials are valid, proxy connection proceeds normally
 
 ### Example Complete Setup
 
 #### Server Side (Remote)
 ```bash
-./twt2main -server -L 2 -b 33333
+./tw2 -server -L 2 -b 33333
 ```
 
 #### Client Side (Local) with Authentication
 ```bash
-./twt2main -L 2 -h remote-server.com -p 33333 -l 3128 -b 33334 \
+./tw2 -L 2 -h remote-server.com -p 33333 -l 3128 -b 33334 \
      -ssh-user tunneluser -ssh-key ~/.ssh/id_rsa \
      -proxy-user proxyuser -proxy-pass securepassword123
 ```
@@ -309,12 +398,42 @@ curl --proxy-user proxyuser:securepassword123 \
 - Verify client is sending proper `Proxy-Authorization` header
 
 #### No Authentication Required
-- If no credentials are configured, TWT2 operates without authentication
+- If no credentials are configured, TW2 operates without authentication
 - Authentication is ignored in server mode
 
 #### Log Messages
 - Successful authentication: `Proxy authentication successful for <host> from <ip>`
 - Failed authentication: `Proxy authentication failed for <host> from <ip>`
+
+## PAC (Proxy Auto-Configuration) Support
+
+TW2 supports PAC files to automatically configure which websites should use the proxy and which should connect directly.
+
+### Features
+- **Automatic PAC serving**: Serves PAC files via HTTP GET requests at `/proxy.pac` and `/wpad.dat`
+- **Custom PAC files**: Load configuration from disk via `-pac-file` option
+- **Default PAC generation**: Automatically generates PAC content for `server.palecci.cz` if no file specified
+- **Browser integration**: Standard PAC file format compatible with all major browsers
+
+### Usage
+
+#### Basic PAC Configuration
+```bash
+# With custom PAC file
+./tw2 -pac-file /path/to/proxy.pac [other options...]
+
+# PAC file URL for browsers: http://localhost:3128/proxy.pac
+```
+
+#### Default PAC Behavior
+If no PAC file is specified, TW2 generates default configuration that:
+- Routes `server.palecci.cz` and `*.palecci.cz` through the proxy
+- Uses direct connection for all other addresses
+
+#### Browser Configuration
+1. Open browser proxy settings
+2. Select "Automatic proxy configuration"
+3. Enter PAC URL: `http://localhost:3128/proxy.pac`
 
 ## Monitoring
 
