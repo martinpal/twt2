@@ -1,6 +1,7 @@
 package twt2
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -28,14 +29,16 @@ var app *App
 type Handler func(http.ResponseWriter, *http.Request)
 
 type PoolConnection struct {
-	Conn      net.Conn
-	SendChan  chan *twtproto.ProxyComm
-	ID        uint64
-	InUse     bool
-	LastUsed  time.Time
-	SSHClient *ssh.Client // SSH client for this connection
-	SSHConn   net.Conn    // SSH connection
-	LocalPort int         // Local port for SSH tunnel
+	Conn            net.Conn
+	SendChan        chan *twtproto.ProxyComm
+	ID              uint64
+	InUse           bool
+	LastUsed        time.Time
+	SSHClient       *ssh.Client        // SSH client for this connection
+	SSHConn         net.Conn           // SSH connection
+	LocalPort       int                // Local port for SSH tunnel
+	keepAliveCancel context.CancelFunc // Cancel function for SSH keep-alive goroutine
+	keepAliveMutex  sync.Mutex         // Mutex to protect keep-alive operations
 }
 
 type Connection struct {
@@ -184,7 +187,7 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 	// Start goroutines for this connection
 	go poolConnectionSender(poolConn)
 	go poolConnectionReceiver(poolConn)
-	go sshKeepAlive(poolConn) // Start SSH keep-alive for this connection
+	startSSHKeepAlive(poolConn) // Start SSH keep-alive for this connection
 
 	// Send initial ping if enabled
 	if ping {
@@ -278,9 +281,27 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 	return allConnections
 }
 
+// startSSHKeepAlive starts the SSH keep-alive goroutine with proper lifecycle management
+func startSSHKeepAlive(poolConn *PoolConnection) {
+	poolConn.keepAliveMutex.Lock()
+	defer poolConn.keepAliveMutex.Unlock()
+
+	// Cancel any existing keep-alive goroutine
+	if poolConn.keepAliveCancel != nil {
+		poolConn.keepAliveCancel()
+	}
+
+	// Create new context for this keep-alive session
+	ctx, cancel := context.WithCancel(context.Background())
+	poolConn.keepAliveCancel = cancel
+
+	// Start the keep-alive goroutine
+	go sshKeepAlive(ctx, poolConn)
+}
+
 // sshKeepAlive sends periodic keep-alive messages to maintain SSH connections
 // This helps prevent connection drops due to firewalls, NAT timeouts, or idle connection policies
-func sshKeepAlive(poolConn *PoolConnection) {
+func sshKeepAlive(ctx context.Context, poolConn *PoolConnection) {
 	const keepAliveInterval = 30 * time.Second // Send keep-alive every 30 seconds
 	const maxKeepAliveFailures = 3             // Close connection after 3 failed keep-alives
 
@@ -290,39 +311,45 @@ func sshKeepAlive(poolConn *PoolConnection) {
 
 	failureCount := 0
 
-	for range ticker.C {
-		if poolConn.SSHClient == nil {
-			log.Tracef("SSH client is nil for pool connection %d, stopping keep-alive", poolConn.ID)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Tracef("SSH keep-alive cancelled for pool connection %d", poolConn.ID)
 			return
-		}
-
-		// Send SSH keep-alive request (empty global request)
-		_, _, err := poolConn.SSHClient.SendRequest("keepalive@openssh.com", true, nil)
-		if err != nil {
-			failureCount++
-			log.Debugf("SSH keep-alive failed for pool connection %d (attempt %d/%d): %v",
-				poolConn.ID, failureCount, maxKeepAliveFailures, err)
-
-			if failureCount >= maxKeepAliveFailures {
-				log.Warnf("SSH keep-alive failed %d times for pool connection %d, closing connection",
-					maxKeepAliveFailures, poolConn.ID)
-
-				// Close the SSH connection to trigger reconnection logic
-				if poolConn.SSHClient != nil {
-					poolConn.SSHClient.Close()
-				}
-				if poolConn.Conn != nil {
-					poolConn.Conn.Close()
-				}
+		case <-ticker.C:
+			if poolConn.SSHClient == nil {
+				log.Tracef("SSH client is nil for pool connection %d, stopping keep-alive", poolConn.ID)
 				return
 			}
-		} else {
-			// Reset failure count on successful keep-alive
-			if failureCount > 0 {
-				log.Tracef("SSH keep-alive recovered for pool connection %d", poolConn.ID)
-				failureCount = 0
+
+			// Send SSH keep-alive request (empty global request)
+			_, _, err := poolConn.SSHClient.SendRequest("keepalive@openssh.com", true, nil)
+			if err != nil {
+				failureCount++
+				log.Debugf("SSH keep-alive failed for pool connection %d (attempt %d/%d): %v",
+					poolConn.ID, failureCount, maxKeepAliveFailures, err)
+
+				if failureCount >= maxKeepAliveFailures {
+					log.Warnf("SSH keep-alive failed %d times for pool connection %d, closing connection",
+						maxKeepAliveFailures, poolConn.ID)
+
+					// Close the SSH connection to trigger reconnection logic
+					if poolConn.SSHClient != nil {
+						poolConn.SSHClient.Close()
+					}
+					if poolConn.Conn != nil {
+						poolConn.Conn.Close()
+					}
+					return
+				}
+			} else {
+				// Reset failure count on successful keep-alive
+				if failureCount > 0 {
+					log.Tracef("SSH keep-alive recovered for pool connection %d", poolConn.ID)
+					failureCount = 0
+				}
+				log.Tracef("SSH keep-alive sent successfully for pool connection %d", poolConn.ID)
 			}
-			log.Tracef("SSH keep-alive sent successfully for pool connection %d", poolConn.ID)
 		}
 	}
 }
@@ -352,6 +379,14 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 		// Clear any connection state that might be corrupted
 		clearConnectionState()
 
+		// Cancel the keep-alive for the old connection
+		poolConn.keepAliveMutex.Lock()
+		if poolConn.keepAliveCancel != nil {
+			poolConn.keepAliveCancel()
+			poolConn.keepAliveCancel = nil
+		}
+		poolConn.keepAliveMutex.Unlock()
+
 		// Close existing connections
 		if poolConn.Conn != nil {
 			poolConn.Conn.Close()
@@ -379,7 +414,7 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				log.Infof("Pool connection %d successfully reconnected", poolConn.ID)
 
 				// Start new SSH keep-alive for the reconnected connection
-				go sshKeepAlive(poolConn)
+				startSSHKeepAlive(poolConn)
 
 				// Reset reconnection delay on successful connection
 				reconnectDelay = 1 * time.Second
@@ -604,6 +639,30 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 var protobufConnection net.Conn // Global variable to store the protobuf connection for server responses
 
+// isTLSTraffic detects if the incoming data appears to be TLS/SSL traffic
+// TLS records have specific content types in the first byte
+func isTLSTraffic(header []byte) bool {
+	if len(header) < 2 {
+		return false
+	}
+
+	// TLS Content Types (RFC 5246):
+	// 0x14 = Change Cipher Spec
+	// 0x15 = Alert
+	// 0x16 = Handshake
+	// 0x17 = Application Data
+	firstByte := header[0]
+	return firstByte == 0x14 || firstByte == 0x15 || firstByte == 0x16 || firstByte == 0x17
+}
+
+// getByteOrZero safely gets a byte from slice or returns 0 if index is out of bounds
+func getByteOrZero(data []byte, index int) byte {
+	if index < len(data) {
+		return data[index]
+	}
+	return 0
+}
+
 func handleConnection(conn net.Conn) {
 	// Store the connection for server responses
 	protobufConnection = conn
@@ -621,6 +680,7 @@ func handleConnection(conn net.Conn) {
 			log.Infof("Error reading frame length: %v", err)
 			return
 		}
+
 		length := int(l[1])*256 + int(l[0])
 
 		// Validate message length to detect frame corruption
@@ -654,6 +714,16 @@ func handleConnection(conn net.Conn) {
 			if err := proto.Unmarshal(B, message); err != nil {
 				log.Warnf("Erroneous message hexdump length(%d): %s", length, hex.Dump(B))
 				log.Errorf("Failed to parse message length(%d): %v", length, err)
+
+				// Provide additional diagnostic information
+				if len(B) > 0 {
+					log.Warnf("First few bytes: %02x %02x %02x %02x",
+						B[0],
+						getByteOrZero(B, 1),
+						getByteOrZero(B, 2),
+						getByteOrZero(B, 3))
+				}
+
 				log.Warnf("Closing connection due to protobuf parse error - will trigger reconnection")
 				return
 			}
