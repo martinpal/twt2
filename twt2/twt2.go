@@ -779,7 +779,7 @@ func isTLSTraffic(header []byte) bool {
 
 // getByteOrZero safely gets a byte from slice or returns 0 if index is out of bounds
 func getByteOrZero(data []byte, index int) byte {
-	if index < len(data) {
+	if index >= 0 && index < len(data) {
 		return data[index]
 	}
 	return 0

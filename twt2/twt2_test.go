@@ -188,7 +188,7 @@ func TestNewApp_ClientMode(t *testing.T) {
 	sshPort := 22
 
 	// Execute
-	app := NewApp(handler, listenPort, peerHost, peerPort, poolInit, poolCap, ping, isClient, sshUser, sshKeyPath, sshPort)
+	app := NewApp(handler, listenPort, peerHost, peerPort, poolInit, poolCap, ping, isClient, sshUser, sshKeyPath, sshPort, false, "", "", "")
 
 	// Assert
 	if app == nil {
@@ -245,7 +245,7 @@ func TestNewApp_ServerMode(t *testing.T) {
 	sshPort := 22
 
 	// Execute
-	app := NewApp(handler, listenPort, peerHost, peerPort, poolInit, poolCap, ping, isClient, sshUser, sshKeyPath, sshPort)
+	app := NewApp(handler, listenPort, peerHost, peerPort, poolInit, poolCap, ping, isClient, sshUser, sshKeyPath, sshPort, false, "", "", "")
 
 	// Assert
 	if app == nil {
@@ -1475,19 +1475,19 @@ func TestNewApp_ExtendedConfigurations(t *testing.T) {
 	handler := http.NotFoundHandler().ServeHTTP
 
 	// Test with empty peer host (server mode)
-	app1 := NewApp(handler, 8080, "", 22, 0, 5, false, true, "user", "/tmp/key", 22)
+	app1 := NewApp(handler, 8080, "", 22, 0, 5, false, true, "user", "/tmp/key", 22, false, "", "", "")
 	if len(app1.PoolConnections) != 0 {
 		t.Error("Expected no pool connections when peer host is empty")
 	}
 
 	// Test with non-client mode
-	app2 := NewApp(handler, 8080, "example.com", 22, 2, 5, true, false, "user", "/tmp/key", 22)
+	app2 := NewApp(handler, 8080, "example.com", 22, 2, 5, true, false, "user", "/tmp/key", 22, false, "", "", "")
 	if len(app2.PoolConnections) != 0 {
 		t.Error("Expected no pool connections in server mode")
 	}
 
 	// Test with zero pool initialization
-	app3 := NewApp(handler, 8080, "example.com", 22, 0, 5, true, true, "user", "/tmp/key", 22)
+	app3 := NewApp(handler, 8080, "example.com", 22, 0, 5, true, true, "user", "/tmp/key", 22, false, "", "", "")
 	if len(app3.PoolConnections) != 0 {
 		t.Error("Expected no pool connections when poolInit is 0")
 	}
@@ -1688,7 +1688,7 @@ func TestNewApp_ParallelPoolCreation(t *testing.T) {
 	handler := http.NotFoundHandler().ServeHTTP
 
 	// Test with a reasonable number of connections that would trigger parallel processing
-	app := NewApp(handler, 8080, "example.com", 22, 15, 20, true, true, "user", "/tmp/nonexistent", 22)
+	app := NewApp(handler, 8080, "example.com", 22, 15, 20, true, true, "user", "/tmp/nonexistent", 22, false, "", "", "")
 
 	// Since the SSH key doesn't exist, no connections should be created
 	if len(app.PoolConnections) != 0 {
@@ -1702,4 +1702,592 @@ func TestNewApp_ParallelPoolCreation(t *testing.T) {
 	if app.PeerHost != "example.com" {
 		t.Errorf("Expected PeerHost 'example.com', got %s", app.PeerHost)
 	}
+}
+
+// Test authenticateProxyRequest function
+func TestAuthenticateProxyRequest(t *testing.T) {
+	tests := []struct {
+		name           string
+		username       string
+		password       string
+		authHeader     string
+		expectedResult bool
+	}{
+		{
+			name:           "No authentication required",
+			username:       "",
+			password:       "",
+			authHeader:     "",
+			expectedResult: true,
+		},
+		{
+			name:           "Valid Basic authentication",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "Basic dXNlcjpwYXNz", // base64 of "user:pass"
+			expectedResult: true,
+		},
+		{
+			name:           "Invalid username",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "Basic d3JvbmdfdXNlcjpwYXNz", // base64 of "wrong_user:pass"
+			expectedResult: false,
+		},
+		{
+			name:           "Invalid password",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "Basic dXNlcjp3cm9uZ19wYXNz", // base64 of "user:wrong_pass"
+			expectedResult: false,
+		},
+		{
+			name:           "Missing auth header",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "",
+			expectedResult: false,
+		},
+		{
+			name:           "Wrong auth type",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "Bearer token123",
+			expectedResult: false,
+		},
+		{
+			name:           "Invalid base64",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "Basic invalid@base64!",
+			expectedResult: false,
+		},
+		{
+			name:           "Malformed credentials",
+			username:       "user",
+			password:       "pass",
+			authHeader:     "Basic dXNlcm5vY29sb24=", // base64 of "usernocolon"
+			expectedResult: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("CONNECT", "example.com:443", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Proxy-Authorization", tt.authHeader)
+			}
+
+			result := authenticateProxyRequest(req, tt.username, tt.password)
+			if result != tt.expectedResult {
+				t.Errorf("Expected %v, got %v", tt.expectedResult, result)
+			}
+		})
+	}
+}
+
+// Test sendProxyAuthRequired function
+func TestSendProxyAuthRequired(t *testing.T) {
+	// Create a mock ResponseWriter
+	w := &mockResponseWriter{}
+
+	sendProxyAuthRequired(w)
+
+	// Check status code
+	if w.statusCode != http.StatusProxyAuthRequired {
+		t.Errorf("Expected status %d, got %d", http.StatusProxyAuthRequired, w.statusCode)
+	}
+
+	// Check Proxy-Authenticate header
+	authHeader := w.Header().Get("Proxy-Authenticate")
+	expectedHeader := "Basic realm=\"TW2 Proxy\""
+	if authHeader != expectedHeader {
+		t.Errorf("Expected Proxy-Authenticate header '%s', got '%s'", expectedHeader, authHeader)
+	}
+
+	// Check response body
+	expectedBody := "Proxy Authentication Required"
+	if string(w.body) != expectedBody {
+		t.Errorf("Expected body '%s', got '%s'", expectedBody, string(w.body))
+	}
+}
+
+// Test servePACFile function
+func TestServePACFile(t *testing.T) {
+	// Save original app state
+	originalApp := app
+
+	tests := []struct {
+		name           string
+		pacFilePath    string
+		expectedStatus int
+		shouldContain  string
+	}{
+		{
+			name:           "No PAC file configured",
+			pacFilePath:    "",
+			expectedStatus: http.StatusOK,
+			shouldContain:  "",
+		},
+		{
+			name:           "Non-existent PAC file",
+			pacFilePath:    "/nonexistent/file.pac",
+			expectedStatus: http.StatusNotFound,
+			shouldContain:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set up test app
+			app = &App{
+				PACFilePath: tt.pacFilePath,
+			}
+
+			w := &mockResponseWriter{}
+			req, _ := http.NewRequest("GET", "/proxy.pac", nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+
+			servePACFile(w, req)
+
+			if w.statusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.statusCode)
+			}
+
+			if tt.expectedStatus == http.StatusOK {
+				// Check headers for successful response
+				contentType := w.Header().Get("Content-Type")
+				expectedContentType := "application/x-ns-proxy-autoconfig"
+				if contentType != expectedContentType {
+					t.Errorf("Expected Content-Type '%s', got '%s'", expectedContentType, contentType)
+				}
+
+				cacheControl := w.Header().Get("Cache-Control")
+				expectedCacheControl := "no-cache, no-store, must-revalidate"
+				if cacheControl != expectedCacheControl {
+					t.Errorf("Expected Cache-Control '%s', got '%s'", expectedCacheControl, cacheControl)
+				}
+			}
+		})
+	}
+
+	// Test with existing PAC file
+	t.Run("Valid PAC file", func(t *testing.T) {
+		app = &App{
+			PACFilePath: "/home/martin/source/twt2/proxy.pac", // Use the existing PAC file
+		}
+
+		w := &mockResponseWriter{}
+		req, _ := http.NewRequest("GET", "/proxy.pac", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+
+		servePACFile(w, req)
+
+		if w.statusCode != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.statusCode)
+		}
+
+		// Check headers
+		contentType := w.Header().Get("Content-Type")
+		expectedContentType := "application/x-ns-proxy-autoconfig"
+		if contentType != expectedContentType {
+			t.Errorf("Expected Content-Type '%s', got '%s'", expectedContentType, contentType)
+		}
+
+		// Check that we got some content
+		if len(w.body) == 0 {
+			t.Errorf("Expected non-empty response body")
+		}
+
+		// Check that the content contains the function
+		if !bytes.Contains(w.body, []byte("FindProxyForURL")) {
+			t.Errorf("Expected response to contain 'FindProxyForURL'")
+		}
+	})
+
+	// Restore original app state
+	app = originalApp
+}
+
+// Test App.ServeHTTP method for proxy authentication integration
+func TestApp_ServeHTTP_ProxyAuth(t *testing.T) {
+	// Save original app state
+	originalApp := app
+
+	// Test with proxy authentication enabled and a proper handler
+	mockHandler := func(w http.ResponseWriter, r *http.Request) {
+		// Call the Hijack function which contains the actual proxy logic
+		Hijack(w, r)
+	}
+
+	app = NewApp(mockHandler, 8080, "localhost", 9090, 1, 5, false, false, "", "", 22, true, "testuser", "testpass", "/home/martin/source/twt2/proxy.pac")
+
+	tests := []struct {
+		name           string
+		method         string
+		path           string
+		authHeader     string
+		expectedStatus int
+	}{
+		{
+			name:           "GET request for PAC file",
+			method:         "GET",
+			path:           "/proxy.pac",
+			authHeader:     "",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "CONNECT without auth",
+			method:         "CONNECT",
+			path:           "",
+			authHeader:     "",
+			expectedStatus: http.StatusProxyAuthRequired,
+		},
+		{
+			name:           "CONNECT with valid auth",
+			method:         "CONNECT",
+			path:           "",
+			authHeader:     "Basic dGVzdHVzZXI6dGVzdHBhc3M=", // base64 of "testuser:testpass"
+			expectedStatus: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &mockHijackableResponseWriter{}
+
+			var req *http.Request
+			if tt.method == "CONNECT" {
+				req, _ = http.NewRequest(tt.method, "", nil)
+				req.Host = "example.com:443"
+			} else {
+				req, _ = http.NewRequest(tt.method, tt.path, nil)
+			}
+
+			req.RemoteAddr = "127.0.0.1:12345"
+
+			if tt.authHeader != "" {
+				req.Header.Set("Proxy-Authorization", tt.authHeader)
+			}
+
+			app.ServeHTTP(w, req)
+
+			if w.statusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.statusCode)
+			}
+		})
+	}
+
+	// Restore original app state
+	app = originalApp
+}
+
+// Test poolConnectionSender function
+func TestPoolConnectionSender_Coverage(t *testing.T) {
+	// Create a mock pool connection
+	poolConn := &PoolConnection{
+		ID:       1,
+		SendChan: make(chan *twtproto.ProxyComm, 1),
+		Conn:     newMockConn(),
+	}
+
+	// Start the sender in a goroutine
+	go poolConnectionSender(poolConn)
+
+	// Send a test message
+	testMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_PING,
+		Proxy:      0,
+		Connection: 1,
+		Seq:        1,
+	}
+
+	// Send the message and close the channel
+	poolConn.SendChan <- testMessage
+	close(poolConn.SendChan)
+
+	// Give it a moment to process
+	time.Sleep(10 * time.Millisecond)
+
+	// Test passes if no panic occurs
+}
+
+// Test edge cases for isTLSTraffic
+func TestIsTLSTraffic_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		header   []byte
+		expected bool
+	}{
+		{
+			name:     "TLS Handshake with proper length",
+			header:   []byte{0x16, 0x03, 0x03, 0x00, 0x10}, // TLS 1.2 handshake, length 16
+			expected: true,
+		},
+		{
+			name:     "TLS Application Data",
+			header:   []byte{0x17, 0x03, 0x03, 0x00, 0x20}, // TLS 1.2 app data, length 32
+			expected: true,
+		},
+		{
+			name:     "TLS Alert",
+			header:   []byte{0x15, 0x03, 0x03, 0x00, 0x02}, // TLS 1.2 alert, length 2
+			expected: true,
+		},
+		{
+			name:     "TLS Change Cipher Spec",
+			header:   []byte{0x14, 0x03, 0x03, 0x00, 0x01}, // TLS 1.2 change cipher spec
+			expected: true,
+		},
+		{
+			name:     "TLS Handshake with invalid version (still TLS content type)",
+			header:   []byte{0x16, 0x02, 0x00, 0x00, 0x10}, // Invalid version but valid content type
+			expected: true,
+		},
+		{
+			name:     "TLS Handshake with large length (still valid content type)",
+			header:   []byte{0x16, 0x03, 0x03, 0xFF, 0xFF}, // Large length but valid content type
+			expected: true,
+		},
+		{
+			name:     "Header too short (only 1 byte)",
+			header:   []byte{0x16}, // Only content type, no version
+			expected: false,
+		},
+		{
+			name:     "Empty header",
+			header:   []byte{},
+			expected: false,
+		},
+		{
+			name:     "Non-TLS content type",
+			header:   []byte{0x12, 0x03, 0x03, 0x00, 0x10}, // Invalid content type
+			expected: false,
+		},
+		{
+			name:     "HTTP request start",
+			header:   []byte("GET / HTTP/1.1"),
+			expected: false,
+		},
+		{
+			name:     "Minimum valid TLS header",
+			header:   []byte{0x16, 0x03}, // Handshake with minimum length
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isTLSTraffic(tt.header)
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+// Test handleHTTPRequest function
+func TestHandleHTTPRequest(t *testing.T) {
+	// Save original app state
+	originalApp := app
+	app = &App{
+		PACFilePath: "",
+	}
+
+	tests := []struct {
+		name           string
+		method         string
+		path           string
+		expectedStatus int
+		shouldContain  string
+	}{
+		{
+			name:           "PAC file request",
+			method:         "GET",
+			path:           "/proxy.pac",
+			expectedStatus: http.StatusOK,
+			shouldContain:  "",
+		},
+		{
+			name:           "WPAD request",
+			method:         "GET",
+			path:           "/wpad.dat",
+			expectedStatus: http.StatusOK,
+			shouldContain:  "",
+		},
+		{
+			name:           "Other GET request",
+			method:         "GET",
+			path:           "/other",
+			expectedStatus: http.StatusOK,
+			shouldContain:  "TW2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &mockResponseWriter{}
+			req, _ := http.NewRequest(tt.method, tt.path, nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+
+			handleHTTPRequest(w, req)
+
+			if w.statusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.statusCode)
+			}
+
+			if tt.shouldContain != "" && !bytes.Contains(w.body, []byte(tt.shouldContain)) {
+				t.Errorf("Expected response to contain '%s', got '%s'", tt.shouldContain, string(w.body))
+			}
+		})
+	}
+
+	// Restore original app state
+	app = originalApp
+}
+
+// Test getByteOrZero function
+func TestGetByteOrZero(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		index    int
+		expected byte
+	}{
+		{
+			name:     "Valid index",
+			data:     []byte{0x10, 0x20, 0x30},
+			index:    1,
+			expected: 0x20,
+		},
+		{
+			name:     "Index 0",
+			data:     []byte{0x10, 0x20, 0x30},
+			index:    0,
+			expected: 0x10,
+		},
+		{
+			name:     "Index out of bounds",
+			data:     []byte{0x10, 0x20, 0x30},
+			index:    5,
+			expected: 0x00,
+		},
+		{
+			name:     "Negative index",
+			data:     []byte{0x10, 0x20, 0x30},
+			index:    -1,
+			expected: 0x00,
+		},
+		{
+			name:     "Empty slice",
+			data:     []byte{},
+			index:    0,
+			expected: 0x00,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getByteOrZero(tt.data, tt.index)
+			if result != tt.expected {
+				t.Errorf("Expected %d, got %d", tt.expected, result)
+			}
+		})
+	}
+}
+
+// Test startSSHKeepAlive function (basic functionality)
+func TestStartSSHKeepAlive(t *testing.T) {
+	poolConn := &PoolConnection{
+		ID: 1,
+	}
+
+	// This should not panic and should set up the keep-alive context
+	startSSHKeepAlive(poolConn)
+
+	// Verify that the cancel function was set
+	if poolConn.keepAliveCancel == nil {
+		t.Errorf("Expected keepAliveCancel to be set")
+	}
+
+	// Clean up by canceling the context
+	if poolConn.keepAliveCancel != nil {
+		poolConn.keepAliveCancel()
+	}
+}
+
+// Test Hijack function with proxy authentication
+func TestHijack_ProxyAuthentication(t *testing.T) {
+	// Save original app state
+	originalApp := app
+
+	// Set up app with proxy authentication enabled
+	app = NewApp(nil, 8080, "localhost", 9090, 1, 5, false, false, "", "", 22, true, "testuser", "testpass", "")
+
+	tests := []struct {
+		name           string
+		method         string
+		authHeader     string
+		expectedStatus int
+	}{
+		{
+			name:           "GET request with auth enabled",
+			method:         "GET",
+			authHeader:     "",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "CONNECT without auth",
+			method:         "CONNECT",
+			authHeader:     "",
+			expectedStatus: http.StatusProxyAuthRequired,
+		},
+		{
+			name:           "CONNECT with valid auth",
+			method:         "CONNECT",
+			authHeader:     "Basic dGVzdHVzZXI6dGVzdHBhc3M=", // base64 of "testuser:testpass"
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "CONNECT with invalid auth",
+			method:         "CONNECT",
+			authHeader:     "Basic aW52YWxpZDppbnZhbGlk", // base64 of "invalid:invalid"
+			expectedStatus: http.StatusProxyAuthRequired,
+		},
+		{
+			name:           "POST method not allowed",
+			method:         "POST",
+			authHeader:     "",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &mockHijackableResponseWriter{}
+
+			var req *http.Request
+			if tt.method == "CONNECT" {
+				req, _ = http.NewRequest(tt.method, "", nil)
+				req.Host = "example.com:443"
+			} else {
+				req, _ = http.NewRequest(tt.method, "/test", nil)
+			}
+
+			req.RemoteAddr = "127.0.0.1:12345"
+
+			if tt.authHeader != "" {
+				req.Header.Set("Proxy-Authorization", tt.authHeader)
+			}
+
+			Hijack(w, req)
+
+			if w.statusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.statusCode)
+			}
+		})
+	}
+
+	// Restore original app state
+	app = originalApp
 }
