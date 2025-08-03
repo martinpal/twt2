@@ -184,6 +184,7 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 	// Start goroutines for this connection
 	go poolConnectionSender(poolConn)
 	go poolConnectionReceiver(poolConn)
+	go sshKeepAlive(poolConn) // Start SSH keep-alive for this connection
 
 	// Send initial ping if enabled
 	if ping {
@@ -277,6 +278,55 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 	return allConnections
 }
 
+// sshKeepAlive sends periodic keep-alive messages to maintain SSH connections
+// This helps prevent connection drops due to firewalls, NAT timeouts, or idle connection policies
+func sshKeepAlive(poolConn *PoolConnection) {
+	const keepAliveInterval = 30 * time.Second // Send keep-alive every 30 seconds
+	const maxKeepAliveFailures = 3             // Close connection after 3 failed keep-alives
+
+	log.Tracef("Starting SSH keep-alive for pool connection %d", poolConn.ID)
+	ticker := time.NewTicker(keepAliveInterval)
+	defer ticker.Stop()
+
+	failureCount := 0
+
+	for range ticker.C {
+		if poolConn.SSHClient == nil {
+			log.Tracef("SSH client is nil for pool connection %d, stopping keep-alive", poolConn.ID)
+			return
+		}
+
+		// Send SSH keep-alive request (empty global request)
+		_, _, err := poolConn.SSHClient.SendRequest("keepalive@openssh.com", true, nil)
+		if err != nil {
+			failureCount++
+			log.Debugf("SSH keep-alive failed for pool connection %d (attempt %d/%d): %v",
+				poolConn.ID, failureCount, maxKeepAliveFailures, err)
+
+			if failureCount >= maxKeepAliveFailures {
+				log.Warnf("SSH keep-alive failed %d times for pool connection %d, closing connection",
+					maxKeepAliveFailures, poolConn.ID)
+
+				// Close the SSH connection to trigger reconnection logic
+				if poolConn.SSHClient != nil {
+					poolConn.SSHClient.Close()
+				}
+				if poolConn.Conn != nil {
+					poolConn.Conn.Close()
+				}
+				return
+			}
+		} else {
+			// Reset failure count on successful keep-alive
+			if failureCount > 0 {
+				log.Tracef("SSH keep-alive recovered for pool connection %d", poolConn.ID)
+				failureCount = 0
+			}
+			log.Tracef("SSH keep-alive sent successfully for pool connection %d", poolConn.ID)
+		}
+	}
+}
+
 func poolConnectionSender(poolConn *PoolConnection) {
 	log.Tracef("Starting sender goroutine for pool connection %d", poolConn.ID)
 	for message := range poolConn.SendChan {
@@ -327,6 +377,9 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				app.PoolMutex.Unlock()
 
 				log.Infof("Pool connection %d successfully reconnected", poolConn.ID)
+
+				// Start new SSH keep-alive for the reconnected connection
+				go sshKeepAlive(poolConn)
 
 				// Reset reconnection delay on successful connection
 				reconnectDelay = 1 * time.Second
