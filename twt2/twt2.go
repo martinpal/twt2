@@ -41,6 +41,8 @@ type PoolConnection struct {
 	LocalPort       int                // Local port for SSH tunnel
 	keepAliveCancel context.CancelFunc // Cancel function for SSH keep-alive goroutine
 	keepAliveMutex  sync.Mutex         // Mutex to protect keep-alive operations
+	retryCancel     context.CancelFunc // Cancel function for retry goroutine
+	retryCtx        context.Context    // Context for retry operations
 }
 
 type Connection struct {
@@ -264,7 +266,27 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 						mutex.Unlock()
 						log.Tracef("Pool connection %d created successfully", connID)
 					} else {
-						log.Warnf("Failed to create pool connection %d", connID)
+						log.Warnf("Failed to create pool connection %d, creating placeholder for retry", connID)
+						// Create a placeholder pool connection that will retry using existing reconnection logic
+						retryCtx, retryCancel := context.WithCancel(context.Background())
+						placeholderConn := &PoolConnection{
+							Conn:        nil, // No connection initially
+							SendChan:    make(chan *twtproto.ProxyComm, 100),
+							ID:          uint64(connID),
+							InUse:       false,
+							LastUsed:    time.Now(),
+							retryCtx:    retryCtx,
+							retryCancel: retryCancel,
+						}
+
+						// Start the sender and receiver goroutines - receiver will handle reconnection
+						go poolConnectionSender(placeholderConn)
+						go poolConnectionReceiver(placeholderConn)
+
+						mutex.Lock()
+						groupConnections = append(groupConnections, placeholderConn)
+						mutex.Unlock()
+						log.Tracef("Created placeholder pool connection %d for retry", connID)
 					}
 				}(i)
 			}
@@ -291,6 +313,22 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 
 	log.Infof("Parallel pool creation completed: %d connections created out of %d requested", len(allConnections), poolInit)
 	return allConnections
+}
+
+// StopAllPoolConnections stops all retry goroutines for pool connections (for testing)
+func StopAllPoolConnections() {
+	if app == nil {
+		return
+	}
+
+	app.PoolMutex.Lock()
+	defer app.PoolMutex.Unlock()
+
+	for _, poolConn := range app.PoolConnections {
+		if poolConn.retryCancel != nil {
+			poolConn.retryCancel()
+		}
+	}
 }
 
 // startSSHKeepAlive starts the SSH keep-alive goroutine with proper lifecycle management
@@ -383,13 +421,30 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 	const reconnectBackoffMultiplier = 2
 
 	for {
+		// Check if context was canceled (for tests)
+		if poolConn.retryCtx != nil {
+			select {
+			case <-poolConn.retryCtx.Done():
+				log.Tracef("Pool connection %d receiver goroutine canceled", poolConn.ID)
+				return
+			default:
+			}
+		}
+
 		// Handle the connection - this will block until connection fails
-		handleConnection(poolConn.Conn)
+		// If poolConn.Conn is nil (placeholder connection), this will exit immediately
+		// and trigger the reconnection logic below
+		if poolConn.Conn != nil {
+			handleConnection(poolConn.Conn)
+			log.Warnf("Pool connection %d lost, attempting reconnection in %v", poolConn.ID, reconnectDelay)
+		} else {
+			log.Infof("Pool connection %d starting initial connection attempt", poolConn.ID)
+		}
 
-		log.Warnf("Pool connection %d lost, attempting reconnection in %v", poolConn.ID, reconnectDelay)
-
-		// Clear any connection state that might be corrupted
-		clearConnectionState()
+		// Clear any connection state that might be corrupted (only if we had a connection)
+		if poolConn.Conn != nil {
+			clearConnectionState()
+		}
 
 		// Cancel the keep-alive for the old connection
 		poolConn.keepAliveMutex.Lock()
@@ -407,8 +462,23 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 			poolConn.SSHClient.Close()
 		}
 
-		// Wait before reconnecting
-		time.Sleep(reconnectDelay)
+		// Wait before reconnecting (skip initial delay for first connection attempt)
+		if poolConn.Conn != nil {
+			if poolConn.retryCtx != nil {
+				// Use context with timeout for cancellable sleep
+				timer := time.NewTimer(reconnectDelay)
+				select {
+				case <-poolConn.retryCtx.Done():
+					timer.Stop()
+					log.Tracef("Pool connection %d receiver goroutine canceled during delay", poolConn.ID)
+					return
+				case <-timer.C:
+					// Continue with reconnection
+				}
+			} else {
+				time.Sleep(reconnectDelay)
+			}
+		}
 
 		// Attempt to recreate the connection
 		if app != nil {
@@ -423,7 +493,7 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				poolConn.LastUsed = time.Now()
 				app.PoolMutex.Unlock()
 
-				log.Infof("Pool connection %d successfully reconnected", poolConn.ID)
+				log.Infof("Pool connection %d successfully connected", poolConn.ID)
 
 				// Start new SSH keep-alive for the reconnected connection
 				startSSHKeepAlive(poolConn)

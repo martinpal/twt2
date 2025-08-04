@@ -1667,16 +1667,35 @@ func TestCreatePoolConnectionsParallel(t *testing.T) {
 		t.Errorf("Expected 0 connections for poolInit=0, got %d", len(connections))
 	}
 
-	// Test with small number of connections (all should fail due to nonexistent key)
+	// Test with small number of connections (all should fail due to nonexistent key but create placeholders)
 	connections = createPoolConnectionsParallel(5, "example.com", 22, false, "user", "/nonexistent/key", 22)
-	if len(connections) != 0 {
-		t.Errorf("Expected 0 connections with invalid key, got %d", len(connections))
+	if len(connections) != 5 {
+		t.Errorf("Expected 5 placeholder connections with invalid key, got %d", len(connections))
+	}
+	// Verify they are placeholder connections (Conn should be nil)
+	for i, conn := range connections {
+		if conn.Conn != nil {
+			t.Errorf("Expected placeholder connection %d to have nil Conn, but it has a connection", i)
+		}
 	}
 
 	// Test with larger number that would create multiple groups
 	connections = createPoolConnectionsParallel(25, "example.com", 22, false, "user", "/nonexistent/key", 22)
-	if len(connections) != 0 {
-		t.Errorf("Expected 0 connections with invalid key for 25 connections, got %d", len(connections))
+	if len(connections) != 25 {
+		t.Errorf("Expected 25 placeholder connections with invalid key for 25 connections, got %d", len(connections))
+	}
+	// Verify they are placeholder connections (Conn should be nil)
+	for i, conn := range connections {
+		if conn.Conn != nil {
+			t.Errorf("Expected placeholder connection %d to have nil Conn, but it has a connection", i)
+		}
+	}
+
+	// Stop retry goroutines to prevent test interference
+	for _, conn := range connections {
+		if conn.retryCancel != nil {
+			conn.retryCancel()
+		}
 	}
 
 	// The function should handle the parallel processing correctly even when connections fail
@@ -1690,9 +1709,15 @@ func TestNewApp_ParallelPoolCreation(t *testing.T) {
 	// Test with a reasonable number of connections that would trigger parallel processing
 	app := NewApp(handler, 8080, "example.com", 22, 15, 20, true, true, "user", "/tmp/nonexistent", 22, false, "", "", "")
 
-	// Since the SSH key doesn't exist, no connections should be created
-	if len(app.PoolConnections) != 0 {
-		t.Errorf("Expected 0 pool connections with invalid SSH key, got %d", len(app.PoolConnections))
+	// Since the SSH key doesn't exist, placeholder connections should be created
+	if len(app.PoolConnections) != 15 {
+		t.Errorf("Expected 15 placeholder pool connections with invalid SSH key, got %d", len(app.PoolConnections))
+	}
+	// Verify they are placeholder connections (Conn should be nil)
+	for i, conn := range app.PoolConnections {
+		if conn.Conn != nil {
+			t.Errorf("Expected placeholder connection %d to have nil Conn, but it has a connection", i)
+		}
 	}
 
 	// Verify other app properties are set correctly
@@ -1702,6 +1727,9 @@ func TestNewApp_ParallelPoolCreation(t *testing.T) {
 	if app.PeerHost != "example.com" {
 		t.Errorf("Expected PeerHost 'example.com', got %s", app.PeerHost)
 	}
+
+	// Stop retry goroutines to prevent test interference
+	StopAllPoolConnections()
 }
 
 // Test authenticateProxyRequest function
