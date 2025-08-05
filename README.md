@@ -85,14 +85,51 @@ The system uses Protocol Buffers with the following message types:
 
 ### Build Instructions
 
+#### Quick Build (with version info)
+
 ```bash
 # Clone the repository
 git clone <repository-url>
 cd twt2
 
-# Build the main executable
+# Build using the provided build script (includes git commit hash)
+./build.sh
+```
+
+#### Build Options
+
+The build script supports various options for different use cases:
+
+```bash
+# Static binary with version info
+./build.sh --static
+
+# Custom output name
+./build.sh --output tw2-server
+
+# Verbose build with additional info
+./build.sh --verbose
+
+# Show all build options
+./build.sh --help
+```
+
+#### Manual Build (basic)
+
+```bash
+# Build without version info (not recommended)
 cd main
 go build -o tw2
+```
+
+#### Build with Custom Version Info
+
+```bash
+# Manual build with version embedding
+cd main
+COMMIT_HASH=$(git rev-parse --short HEAD)
+BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+go build -ldflags "-X 'main.commitHash=${COMMIT_HASH}' -X 'main.buildTime=${BUILD_TIME}'" -o tw2
 ```
 
 ### Building All Modules
@@ -182,6 +219,18 @@ Options:
   -proxy-user string Username for proxy authentication (client mode only)
   -proxy-pass string Password for proxy authentication (client mode only)
   -pac-file string   Path to PAC (Proxy Auto-Configuration) file (client mode only, optional)
+  -version      Show version information and exit
+```
+
+### Version Information
+
+```bash
+# Show version, commit hash, and build information
+./tw2 -version
+
+# Version info is also displayed at startup
+# Example output:
+# TW2 (Trans-Warp Tunnel Proxy) - Commit: a1b2c3d, Built: 2025-08-06 10:30:45 UTC
 ```
 
 ### Basic Usage Examples

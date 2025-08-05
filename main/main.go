@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"path"
 	"runtime"
 	"strconv"
@@ -14,6 +15,20 @@ import (
 
 	twt2 "palecci.cz/twt2"
 )
+
+// Build-time variables (set via -ldflags during build)
+var (
+	commitHash = "unknown"
+	buildTime  = "unknown"
+)
+
+// printVersion prints version information and exits
+func printVersion() {
+	fmt.Printf("Commit Hash: %s\n", commitHash)
+	fmt.Printf("Build Time:  %s\n", buildTime)
+	fmt.Printf("Go Version:  %s\n", runtime.Version())
+	os.Exit(0)
+}
 
 func goid() int {
 	var buf [64]byte
@@ -65,6 +80,13 @@ func main() {
 		},
 	})
 
+	// Custom help message with version information
+	flag.Usage = func() {
+		fmt.Printf("TW2 (Trans-Warp Tunnel Proxy) - Commit: %s, Built: %s\n", commitHash, buildTime)
+		fmt.Printf("Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+
 	logLevel := flag.Int("L", 2, "Log level. (1) Error, (2) Warn, (3) Info, (4) Debug, (5) Trace")
 	proxyport := flag.Int("l", 3128, "Our http proxy port to listen on")
 	listenPort := flag.Int("b", 33333, "Our protobuf port to listen on")
@@ -77,7 +99,17 @@ func main() {
 	proxyUser := flag.String("proxy-user", "", "Username for proxy authentication (client mode only)")
 	proxyPass := flag.String("proxy-pass", "", "Password for proxy authentication (client mode only)")
 	pacFile := flag.String("pac-file", "", "Path to PAC (Proxy Auto-Configuration) file (client mode only, optional)")
+	version := flag.Bool("version", false, "Show version information and exit")
 	flag.Parse()
+
+	// Handle version flag first (before any other output)
+	if *version {
+		printVersion()
+	}
+
+	// Print version information at startup
+	fmt.Printf("TW2 (Trans-Warp Tunnel Proxy) - Commit: %s, Built: %s\n", commitHash, buildTime)
+
 	setLogLevel(logLevel)
 
 	// Determine if this is client or server mode
