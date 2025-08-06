@@ -43,6 +43,8 @@ type PoolConnection struct {
 	keepAliveMutex  sync.Mutex         // Mutex to protect keep-alive operations
 	retryCancel     context.CancelFunc // Cancel function for retry goroutine
 	retryCtx        context.Context    // Context for retry operations
+	LastHealthCheck time.Time          // Last time connection health was verified
+	Healthy         bool               // Whether connection is considered healthy
 }
 
 type Connection struct {
@@ -109,6 +111,10 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 		appInstance.PoolConnections = createPoolConnectionsParallel(poolInit, appInstance.PeerHost, appInstance.PeerPort, ping, sshUser, sshKeyPath, appInstance.SSHPort)
 
 		log.Debugf("Created %d pool connections", len(appInstance.PoolConnections))
+
+		// Start connection health monitoring
+		startConnectionHealthMonitor()
+		log.Debug("Started connection health monitoring")
 	} else {
 		log.Debug("Server side - no pool connections created")
 	}
@@ -188,14 +194,16 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 	}
 
 	poolConn := &PoolConnection{
-		Conn:      remoteConn,
-		SendChan:  make(chan *twtproto.ProxyComm, 100),
-		ID:        id,
-		InUse:     false,
-		LastUsed:  time.Now(),
-		SSHClient: sshConn,
-		SSHConn:   remoteConn,
-		LocalPort: localPort,
+		Conn:            remoteConn,
+		SendChan:        make(chan *twtproto.ProxyComm, 100),
+		ID:              id,
+		InUse:           false,
+		LastUsed:        time.Now(),
+		SSHClient:       sshConn,
+		SSHConn:         remoteConn,
+		LocalPort:       localPort,
+		LastHealthCheck: time.Now(),
+		Healthy:         true,
 	}
 
 	// Start goroutines for this connection
@@ -270,13 +278,15 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 						// Create a placeholder pool connection that will retry using existing reconnection logic
 						retryCtx, retryCancel := context.WithCancel(context.Background())
 						placeholderConn := &PoolConnection{
-							Conn:        nil, // No connection initially
-							SendChan:    make(chan *twtproto.ProxyComm, 100),
-							ID:          uint64(connID),
-							InUse:       false,
-							LastUsed:    time.Now(),
-							retryCtx:    retryCtx,
-							retryCancel: retryCancel,
+							Conn:            nil, // No connection initially
+							SendChan:        make(chan *twtproto.ProxyComm, 100),
+							ID:              uint64(connID),
+							InUse:           false,
+							LastUsed:        time.Now(),
+							retryCtx:        retryCtx,
+							retryCancel:     retryCancel,
+							LastHealthCheck: time.Now(),
+							Healthy:         false, // Not healthy until connected
 						}
 
 						// Start the sender and receiver goroutines - receiver will handle reconnection
@@ -349,7 +359,58 @@ func startSSHKeepAlive(poolConn *PoolConnection) {
 	go sshKeepAlive(ctx, poolConn)
 }
 
-// sshKeepAlive sends periodic keep-alive messages to maintain SSH connections
+// startConnectionHealthMonitor starts a background goroutine that monitors pool connection health
+func startConnectionHealthMonitor() {
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute) // Check every 2 minutes
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if app == nil || len(app.PoolConnections) == 0 {
+				continue
+			}
+
+			app.PoolMutex.Lock()
+			healthyCount := 0
+			totalCount := len(app.PoolConnections)
+
+			for _, poolConn := range app.PoolConnections {
+				if poolConn == nil {
+					continue
+				}
+
+				if poolConn.Healthy && poolConn.Conn != nil {
+					healthyCount++
+
+					// Check for stale connections (no activity for 10 minutes)
+					if time.Since(poolConn.LastHealthCheck) > 10*time.Minute {
+						log.Warnf("Pool connection %d appears stale (last check %v ago), checking channel queue",
+							poolConn.ID, time.Since(poolConn.LastHealthCheck))
+
+						// Check if send channel is getting full
+						queuedMessages := len(poolConn.SendChan)
+						capacity := cap(poolConn.SendChan)
+						if queuedMessages > capacity/2 {
+							log.Warnf("Pool connection %d has %d/%d messages queued - possible congestion",
+								poolConn.ID, queuedMessages, capacity)
+
+							// If queue is nearly full, mark as unhealthy to trigger reconnection
+							if queuedMessages > capacity*3/4 {
+								log.Errorf("Pool connection %d queue nearly full (%d/%d) - marking unhealthy",
+									poolConn.ID, queuedMessages, capacity)
+								poolConn.Healthy = false
+							}
+						}
+					}
+				}
+			}
+
+			log.Debugf("Connection health: %d/%d healthy connections", healthyCount, totalCount)
+			app.PoolMutex.Unlock()
+		}
+	}()
+}
+
 // This helps prevent connection drops due to firewalls, NAT timeouts, or idle connection policies
 func sshKeepAlive(ctx context.Context, poolConn *PoolConnection) {
 	const keepAliveInterval = 30 * time.Second // Send keep-alive every 30 seconds
@@ -405,9 +466,66 @@ func sshKeepAlive(ctx context.Context, poolConn *PoolConnection) {
 }
 
 func poolConnectionSender(poolConn *PoolConnection) {
+	if poolConn == nil {
+		log.Errorf("poolConnectionSender called with nil poolConn")
+		return
+	}
+
 	log.Tracef("Starting sender goroutine for pool connection %d", poolConn.ID)
+
 	for message := range poolConn.SendChan {
-		sendProtobufToConn(poolConn.Conn, message)
+		// Check if connection is nil (closed/failed)
+		if poolConn.Conn == nil {
+			log.Warnf("Pool connection %d has nil connection, dropping message", poolConn.ID)
+			poolConn.Healthy = false
+			continue
+		}
+
+		// Send with timeout monitoring
+		done := make(chan bool, 1)
+		var sendError error
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("Panic in sendProtobufToConn for connection %d: %v", poolConn.ID, r)
+					sendError = fmt.Errorf("panic: %v", r)
+				}
+				done <- true
+			}()
+
+			// Set a write deadline before sending
+			if poolConn.Conn != nil {
+				poolConn.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			}
+
+			sendProtobufToConn(poolConn.Conn, message)
+		}()
+
+		select {
+		case <-done:
+			if sendError != nil {
+				log.Errorf("Pool connection %d send error: %v - marking as unhealthy", poolConn.ID, sendError)
+				poolConn.Healthy = false
+				if poolConn.Conn != nil {
+					poolConn.Conn.Close()
+					poolConn.Conn = nil
+				}
+				return // Exit sender to trigger reconnection via receiver
+			}
+			// Message sent successfully - mark as healthy
+			poolConn.Healthy = true
+			poolConn.LastHealthCheck = time.Now()
+
+		case <-time.After(60 * time.Second):
+			log.Errorf("Pool connection %d write timeout - marking as failed", poolConn.ID)
+			// Mark connection as failed to trigger reconnection
+			poolConn.Healthy = false
+			if poolConn.Conn != nil {
+				poolConn.Conn.Close()
+				poolConn.Conn = nil
+			}
+			return // Exit sender to trigger reconnection via receiver
+		}
 	}
 	log.Tracef("Sender goroutine for pool connection %d ended", poolConn.ID)
 }
@@ -437,6 +555,8 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 		if poolConn.Conn != nil {
 			handleConnection(poolConn.Conn)
 			log.Warnf("Pool connection %d lost, attempting reconnection in %v", poolConn.ID, reconnectDelay)
+			// Mark connection as unhealthy immediately
+			poolConn.Healthy = false
 		} else {
 			log.Infof("Pool connection %d starting initial connection attempt", poolConn.ID)
 		}
@@ -491,6 +611,8 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				poolConn.SSHConn = newPoolConn.SSHConn
 				poolConn.LocalPort = newPoolConn.LocalPort
 				poolConn.LastUsed = time.Now()
+				poolConn.Healthy = true // Mark as healthy after successful reconnection
+				poolConn.LastHealthCheck = time.Now()
 				app.PoolMutex.Unlock()
 
 				log.Infof("Pool connection %d successfully connected", poolConn.ID)
@@ -770,10 +892,25 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 	B := make([]byte, 0, 2+length)
 	B = append(B, size...)
 	B = append(B, data...)
-	conn.Write(B)
+
+	// Set write timeout to prevent blocking
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	_, err = conn.Write(B)
+	if err != nil {
+		log.Warnf("Failed to write protobuf message: %v", err)
+		return
+	}
+	// Clear the deadline after successful write
+	conn.SetWriteDeadline(time.Time{})
 }
 
 func sendProtobuf(message *twtproto.ProxyComm) {
+	// Check if app is initialized
+	if app == nil {
+		log.Errorf("App not initialized, cannot send protobuf message")
+		return
+	}
+
 	// Check if we're in server mode (no pool connections)
 	if len(app.PoolConnections) == 0 {
 		// Server mode - send directly through the protobuf connection
@@ -791,19 +928,52 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	app.PoolMutex.Lock()
 	defer app.PoolMutex.Unlock()
 
-	// Find an available pool connection
+	// Find a healthy available pool connection
 	var selectedConn *PoolConnection
+	var healthyConnections []*PoolConnection
+
+	// First pass - find healthy, available connections
 	for _, poolConn := range app.PoolConnections {
-		if !poolConn.InUse {
-			selectedConn = poolConn
-			break
+		if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy && !poolConn.InUse {
+			healthyConnections = append(healthyConnections, poolConn)
+			if selectedConn == nil {
+				selectedConn = poolConn
+				break
+			}
 		}
 	}
 
-	// If no connection available, use the least recently used one
-	if selectedConn == nil && len(app.PoolConnections) > 0 {
-		selectedConn = app.PoolConnections[0]
+	// Second pass - if no available connections, use healthy but busy ones
+	if selectedConn == nil && len(healthyConnections) == 0 {
 		for _, poolConn := range app.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy {
+				healthyConnections = append(healthyConnections, poolConn)
+			}
+		}
+	}
+
+	// Third pass - if no healthy connections, use any available connections
+	if selectedConn == nil && len(healthyConnections) == 0 {
+		for _, poolConn := range app.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil && !poolConn.InUse {
+				healthyConnections = append(healthyConnections, poolConn)
+			}
+		}
+	}
+
+	// Fourth pass - if still no connections, use any connection with a valid Conn
+	if selectedConn == nil && len(healthyConnections) == 0 {
+		for _, poolConn := range app.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil {
+				healthyConnections = append(healthyConnections, poolConn)
+			}
+		}
+	}
+
+	// Use least recently used from healthy connections
+	if selectedConn == nil && len(healthyConnections) > 0 {
+		selectedConn = healthyConnections[0]
+		for _, poolConn := range healthyConnections {
 			if poolConn.LastUsed.Before(selectedConn.LastUsed) {
 				selectedConn = poolConn
 			}
@@ -811,19 +981,33 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	}
 
 	if selectedConn == nil {
-		log.Errorf("No pool connections available")
+		log.Errorf("No healthy pool connections available (total: %d)", len(app.PoolConnections))
 		return
 	}
 
 	log.Tracef("Sending message via pool connection %d", selectedConn.ID)
 	selectedConn.LastUsed = time.Now()
 
-	// Send message through the channel (non-blocking)
+	// Send message through the channel (non-blocking with timeout)
 	select {
 	case selectedConn.SendChan <- message:
 		log.Tracef("Message queued for pool connection %d", selectedConn.ID)
 	default:
-		log.Warnf("Send channel full for pool connection %d", selectedConn.ID)
+		log.Warnf("Send channel full for pool connection %d (capacity: %d)", selectedConn.ID, cap(selectedConn.SendChan))
+		// Try to find another connection instead of dropping the message
+		for _, poolConn := range healthyConnections {
+			if poolConn != selectedConn {
+				select {
+				case poolConn.SendChan <- message:
+					log.Tracef("Message queued for alternative pool connection %d", poolConn.ID)
+					poolConn.LastUsed = time.Now()
+					return
+				default:
+					continue // Try next connection
+				}
+			}
+		}
+		log.Errorf("All pool connection channels are full - dropping message type %v for connection %d", message.Mt, message.Connection)
 	}
 }
 
