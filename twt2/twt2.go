@@ -28,7 +28,192 @@ const chunkSize = 1280
 
 var app *App
 
+// Global statistics for server-side tracking
+var serverStats struct {
+	TotalConnectionsHandled uint64
+	TotalMessagesProcessed  uint64
+	TotalBytesUp            uint64
+	TotalBytesDown          uint64
+	MessageCounts           map[twtproto.ProxyComm_MessageType]uint64 // Count by message type
+	mutex                   sync.RWMutex
+}
+
 type Handler func(http.ResponseWriter, *http.Request)
+
+// PoolConnectionStats tracks statistics for each pool connection
+type PoolConnectionStats struct {
+	MessageCounts map[twtproto.ProxyComm_MessageType]uint64 // Count of messages by type
+	BytesUp       uint64                                    // Total bytes sent DATA_UP
+	BytesDown     uint64                                    // Total bytes sent DATA_DOWN
+	CreatedAt     time.Time                                 // When this connection was created
+	LastMessageAt time.Time                                 // When last message was sent
+	mutex         sync.RWMutex                              // Protect statistics
+}
+
+// NewPoolConnectionStats creates a new statistics tracker
+func NewPoolConnectionStats() *PoolConnectionStats {
+	return &PoolConnectionStats{
+		MessageCounts: make(map[twtproto.ProxyComm_MessageType]uint64),
+		CreatedAt:     time.Now(),
+		LastMessageAt: time.Now(),
+	}
+}
+
+// IncrementMessage increments the counter for a specific message type and bytes if applicable
+func (s *PoolConnectionStats) IncrementMessage(msgType twtproto.ProxyComm_MessageType, dataLen int) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.MessageCounts[msgType]++
+	s.LastMessageAt = time.Now()
+
+	switch msgType {
+	case twtproto.ProxyComm_DATA_UP:
+		s.BytesUp += uint64(dataLen)
+	case twtproto.ProxyComm_DATA_DOWN:
+		s.BytesDown += uint64(dataLen)
+	}
+}
+
+// GetStats returns a copy of the current statistics
+func (s *PoolConnectionStats) GetStats() (map[twtproto.ProxyComm_MessageType]uint64, uint64, uint64, time.Time, time.Time) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	// Create a copy of the message counts map
+	counts := make(map[twtproto.ProxyComm_MessageType]uint64)
+	for k, v := range s.MessageCounts {
+		counts[k] = v
+	}
+
+	return counts, s.BytesUp, s.BytesDown, s.CreatedAt, s.LastMessageAt
+}
+
+// startStatsLogger starts a goroutine that logs connection pool statistics every 5 minutes
+func startStatsLogger() {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for range ticker.C {
+			logConnectionPoolStats()
+		}
+	}()
+}
+
+// logConnectionPoolStats logs detailed statistics for all pool connections (client) or connection stats (server)
+func logConnectionPoolStats() {
+	if app == nil {
+		return
+	}
+
+	// Check if this is client side (has pool connections) or server side
+	app.PoolMutex.Lock()
+	isClientSide := len(app.PoolConnections) > 0
+	app.PoolMutex.Unlock()
+
+	if isClientSide {
+		// Client side - log pool connection statistics
+		app.PoolMutex.Lock()
+		defer app.PoolMutex.Unlock()
+
+		log.Debugf("=== Client Pool Connection Statistics ===")
+		log.Debugf("Total pool connections: %d", len(app.PoolConnections))
+
+		totalMessages := make(map[twtproto.ProxyComm_MessageType]uint64)
+		var totalBytesUp, totalBytesDown uint64
+
+		for i, conn := range app.PoolConnections {
+			if conn.Stats == nil {
+				log.Debugf("Connection %d (ID: %d): No statistics available", i, conn.ID)
+				continue
+			}
+
+			counts, bytesUp, bytesDown, createdAt, lastMessageAt := conn.Stats.GetStats()
+
+			log.Debugf("Connection %d (ID: %d):", i, conn.ID)
+			log.Debugf("  Healthy: %v, In Use: %v", conn.Healthy, conn.InUse)
+			log.Debugf("  Created: %v, Last Message: %v", createdAt.Format(time.RFC3339), lastMessageAt.Format(time.RFC3339))
+			log.Debugf("  Bytes Up: %d, Bytes Down: %d", bytesUp, bytesDown)
+
+			for msgType, count := range counts {
+				if count > 0 {
+					log.Debugf("  %s: %d messages", msgType.String(), count)
+					totalMessages[msgType] += count
+				}
+			}
+
+			totalBytesUp += bytesUp
+			totalBytesDown += bytesDown
+		}
+
+		log.Debugf("=== Pool Totals ===")
+		log.Debugf("Total Bytes Up: %d, Total Bytes Down: %d", totalBytesUp, totalBytesDown)
+		for msgType, total := range totalMessages {
+			if total > 0 {
+				log.Debugf("Total %s messages: %d", msgType.String(), total)
+			}
+		}
+		log.Debugf("=== End Client Statistics ===")
+	} else {
+		// Server side - log active connection statistics
+		log.Debugf("=== Server Connection Statistics ===")
+
+		app.LocalConnectionMutex.Lock()
+		localConnCount := len(app.LocalConnections)
+		var localConnDetails []string
+		for connID, conn := range app.LocalConnections {
+			localConnDetails = append(localConnDetails, fmt.Sprintf("ID:%d(SeqIn:%d)", connID, conn.LastSeqIn))
+		}
+		app.LocalConnectionMutex.Unlock()
+
+		app.RemoteConnectionMutex.Lock()
+		remoteConnCount := len(app.RemoteConnections)
+		var remoteConnDetails []string
+		for connID, conn := range app.RemoteConnections {
+			remoteConnDetails = append(remoteConnDetails, fmt.Sprintf("ID:%d(SeqIn:%d,SeqOut:%d)", connID, conn.LastSeqIn, conn.NextSeqOut))
+		}
+		app.RemoteConnectionMutex.Unlock()
+
+		protobufConnectionMutex.RLock()
+		hasProtobufConn := protobufConnection != nil
+		protobufConnectionMutex.RUnlock()
+
+		// Get global server statistics
+		serverStats.mutex.RLock()
+		totalConnections := serverStats.TotalConnectionsHandled
+		totalMessages := serverStats.TotalMessagesProcessed
+		totalBytesUp := serverStats.TotalBytesUp
+		totalBytesDown := serverStats.TotalBytesDown
+		// Create a copy of message counts
+		messageCounts := make(map[twtproto.ProxyComm_MessageType]uint64)
+		for k, v := range serverStats.MessageCounts {
+			messageCounts[k] = v
+		}
+		serverStats.mutex.RUnlock()
+
+		log.Debugf("Active local connections: %d", localConnCount)
+		if len(localConnDetails) > 0 {
+			log.Debugf("  Local connection details: %v", localConnDetails)
+		}
+		log.Debugf("Active remote connections: %d", remoteConnCount)
+		if len(remoteConnDetails) > 0 {
+			log.Debugf("  Remote connection details: %v", remoteConnDetails)
+		}
+		log.Debugf("Protobuf connection active: %v", hasProtobufConn)
+		log.Debugf("Total active connections: %d", localConnCount+remoteConnCount)
+		log.Debugf("Total connections handled: %d", totalConnections)
+		log.Debugf("Total messages processed: %d", totalMessages)
+		log.Debugf("Total bytes up: %d, down: %d", totalBytesUp, totalBytesDown)
+		log.Debugf("Message breakdown:")
+		for msgType, count := range messageCounts {
+			if count > 0 {
+				log.Debugf("  %s: %d messages", msgType.String(), count)
+			}
+		}
+		log.Debugf("Server mode detected (no pool connections)")
+		log.Debugf("=== End Server Statistics ===")
+	}
+}
 
 type PoolConnection struct {
 	Conn            net.Conn
@@ -36,15 +221,16 @@ type PoolConnection struct {
 	ID              uint64
 	InUse           bool
 	LastUsed        time.Time
-	SSHClient       *ssh.Client        // SSH client for this connection
-	SSHConn         net.Conn           // SSH connection
-	LocalPort       int                // Local port for SSH tunnel
-	keepAliveCancel context.CancelFunc // Cancel function for SSH keep-alive goroutine
-	keepAliveMutex  sync.Mutex         // Mutex to protect keep-alive operations
-	retryCancel     context.CancelFunc // Cancel function for retry goroutine
-	retryCtx        context.Context    // Context for retry operations
-	LastHealthCheck time.Time          // Last time connection health was verified
-	Healthy         bool               // Whether connection is considered healthy
+	SSHClient       *ssh.Client          // SSH client for this connection
+	SSHConn         net.Conn             // SSH connection
+	LocalPort       int                  // Local port for SSH tunnel
+	keepAliveCancel context.CancelFunc   // Cancel function for SSH keep-alive goroutine
+	keepAliveMutex  sync.Mutex           // Mutex to protect keep-alive operations
+	retryCancel     context.CancelFunc   // Cancel function for retry goroutine
+	retryCtx        context.Context      // Context for retry operations
+	LastHealthCheck time.Time            // Last time connection health was verified
+	Healthy         bool                 // Whether connection is considered healthy
+	Stats           *PoolConnectionStats // Statistics for this connection
 }
 
 type Connection struct {
@@ -84,6 +270,13 @@ func GetApp() *App {
 }
 
 func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit int, poolCap int, ping bool, isClient bool, sshUser string, sshKeyPath string, sshPort int, proxyAuthEnabled bool, proxyUsername string, proxyPassword string, pacFilePath string) *App {
+	// Initialize server statistics
+	serverStats.mutex.Lock()
+	if serverStats.MessageCounts == nil {
+		serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
+	}
+	serverStats.mutex.Unlock()
+
 	appInstance := &App{
 		ListenPort:        listenPort,
 		PeerHost:          peerHost,
@@ -118,6 +311,10 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 	} else {
 		log.Debug("Server side - no pool connections created")
 	}
+
+	// Start statistics logging on both client and server side
+	startStatsLogger()
+	log.Debug("Started connection pool statistics logging (every minute)")
 
 	// Set the global app variable so GetApp() returns the correct instance
 	app = appInstance
@@ -204,6 +401,7 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 		LocalPort:       localPort,
 		LastHealthCheck: time.Now(),
 		Healthy:         true,
+		Stats:           NewPoolConnectionStats(),
 	}
 
 	// Start goroutines for this connection
@@ -287,6 +485,7 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 							retryCancel:     retryCancel,
 							LastHealthCheck: time.Now(),
 							Healthy:         false, // Not healthy until connected
+							Stats:           NewPoolConnectionStats(),
 						}
 
 						// Start the sender and receiver goroutines - receiver will handle reconnection
@@ -516,6 +715,15 @@ func poolConnectionSender(poolConn *PoolConnection) {
 			poolConn.Healthy = true
 			poolConn.LastHealthCheck = time.Now()
 
+			// Track statistics for successfully sent message (if stats are initialized)
+			if poolConn.Stats != nil {
+				dataLen := 0
+				if message.GetData() != nil {
+					dataLen = len(message.GetData())
+				}
+				poolConn.Stats.IncrementMessage(message.GetMt(), dataLen)
+			}
+
 		case <-time.After(60 * time.Second):
 			log.Errorf("Pool connection %d write timeout - marking as failed", poolConn.ID)
 			// Mark connection as failed to trigger reconnection
@@ -553,7 +761,7 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 		// If poolConn.Conn is nil (placeholder connection), this will exit immediately
 		// and trigger the reconnection logic below
 		if poolConn.Conn != nil {
-			handleConnection(poolConn.Conn)
+			handleConnectionWithPoolConn(poolConn.Conn, poolConn)
 			log.Warnf("Pool connection %d lost, attempting reconnection in %v", poolConn.ID, reconnectDelay)
 			// Mark connection as unhealthy immediately
 			poolConn.Healthy = false
@@ -945,10 +1153,8 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	for _, poolConn := range app.PoolConnections {
 		if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy && !poolConn.InUse {
 			healthyConnections = append(healthyConnections, poolConn)
-			if selectedConn == nil {
-				selectedConn = poolConn
-				break
-			}
+			selectedConn = poolConn
+			break
 		}
 	}
 
@@ -1051,6 +1257,10 @@ func getByteOrZero(data []byte, index int) byte {
 }
 
 func handleConnection(conn net.Conn) {
+	handleConnectionWithPoolConn(conn, nil)
+}
+
+func handleConnectionWithPoolConn(conn net.Conn, poolConn *PoolConnection) {
 	// Store the connection for server responses
 	protobufConnectionMutex.Lock()
 	protobufConnection = conn
@@ -1116,7 +1326,7 @@ func handleConnection(conn net.Conn) {
 				log.Warnf("Closing connection due to protobuf parse error - will trigger reconnection")
 				return
 			}
-			handleProxycommMessage(message)
+			handleProxycommMessageWithPoolConn(message, poolConn)
 		} else {
 			log.Errorf("Error receiving protobuf message, expected %4d, got %4d", length, len(B))
 			log.Warnf("Closing connection due to incomplete message - will trigger reconnection")
@@ -1126,10 +1336,32 @@ func handleConnection(conn net.Conn) {
 }
 
 func handleProxycommMessage(message *twtproto.ProxyComm) {
+	handleProxycommMessageWithPoolConn(message, nil)
+}
+
+func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *PoolConnection) {
 	// Check if app is initialized to prevent race condition crashes
 	if app == nil {
 		log.Warnf("Received message before app initialization, ignoring: %v", message.Mt)
 		return
+	}
+
+	// Track all message processing for server statistics
+	serverStats.mutex.Lock()
+	if serverStats.MessageCounts == nil {
+		serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
+	}
+	serverStats.TotalMessagesProcessed++
+	serverStats.MessageCounts[message.Mt]++
+	serverStats.mutex.Unlock()
+
+	// Track statistics for the specific pool connection if provided (client side)
+	if poolConn != nil && poolConn.Stats != nil {
+		dataLen := 0
+		if message.GetData() != nil {
+			dataLen = len(message.GetData())
+		}
+		poolConn.Stats.IncrementMessage(message.Mt, dataLen)
 	}
 
 	// Marshal message back to show hexdump
@@ -1233,6 +1465,12 @@ func handleProxycommMessage(message *twtproto.ProxyComm) {
 
 func newConnection(message *twtproto.ProxyComm) {
 	log.Infof("Openning connection %4d to %s:%d", message.Connection, message.Address, message.Port)
+
+	// Track this connection for server statistics
+	serverStats.mutex.Lock()
+	serverStats.TotalConnectionsHandled++
+	serverStats.mutex.Unlock()
+
 	conn, err := net.Dial("tcp", net.JoinHostPort(message.Address, strconv.Itoa(int(message.Port))))
 	if err != nil {
 		log.Errorf("Failed to connect to %s:%d for connection %d: %v", message.Address, message.Port, message.Connection, err)
@@ -1244,6 +1482,12 @@ func newConnection(message *twtproto.ProxyComm) {
 			Connection: message.Connection,
 			Seq:        0,
 		}
+
+		// Track outgoing CLOSE_CONN_C messages on server side
+		serverStats.mutex.Lock()
+		serverStats.MessageCounts[twtproto.ProxyComm_CLOSE_CONN_C]++
+		serverStats.mutex.Unlock()
+
 		sendProtobuf(closeMessage)
 		return
 	}
@@ -1262,6 +1506,7 @@ func newConnection(message *twtproto.ProxyComm) {
 
 func closeConnectionRemote(message *twtproto.ProxyComm) {
 	log.Debugf("Closing remote connection %4d", message.Connection)
+
 	connRecord, ok := app.RemoteConnections[message.Connection]
 	if ok {
 		conn := connRecord.Connection
@@ -1276,6 +1521,7 @@ func closeConnectionRemote(message *twtproto.ProxyComm) {
 
 func closeConnectionLocal(message *twtproto.ProxyComm) {
 	log.Debugf("Closing local connection %4d", message.Connection)
+
 	connRecord, ok := app.LocalConnections[message.Connection]
 	if ok {
 		conn := connRecord.Connection
@@ -1286,6 +1532,12 @@ func closeConnectionLocal(message *twtproto.ProxyComm) {
 
 func backwardDataChunk(message *twtproto.ProxyComm) {
 	//  log.Tracef("DATA_DOWN %v", message)
+
+	// Track server statistics (bytes only, message count is tracked in handleProxycommMessage)
+	serverStats.mutex.Lock()
+	serverStats.TotalBytesDown += uint64(len(message.Data))
+	serverStats.mutex.Unlock()
+
 	thisConnection := app.LocalConnections[message.Connection]
 	thisConnection.NextSeqOut++
 	app.LocalConnections[message.Connection] = thisConnection
@@ -1298,6 +1550,11 @@ func backwardDataChunk(message *twtproto.ProxyComm) {
 }
 
 func forwardDataChunk(message *twtproto.ProxyComm) {
+	// Track server statistics (bytes only, message count is tracked in handleProxycommMessage)
+	serverStats.mutex.Lock()
+	serverStats.TotalBytesUp += uint64(len(message.Data))
+	serverStats.mutex.Unlock()
+
 	thisConnection := app.RemoteConnections[message.Connection]
 	thisConnection.NextSeqOut++
 	app.RemoteConnections[message.Connection] = thisConnection
@@ -1333,6 +1590,12 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 					Connection: connID,
 					Seq:        seq,
 				}
+
+				// Track outgoing CLOSE_CONN_C messages on server side
+				serverStats.mutex.Lock()
+				serverStats.MessageCounts[twtproto.ProxyComm_CLOSE_CONN_C]++
+				serverStats.mutex.Unlock()
+
 				sendProtobuf(closeMessage)
 				return
 			}
@@ -1358,6 +1621,12 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 			Seq:        seq,
 			Data:       b[:n],
 		}
+
+		// Track outgoing DATA_DOWN messages on server side
+		serverStats.mutex.Lock()
+		serverStats.MessageCounts[twtproto.ProxyComm_DATA_DOWN]++
+		serverStats.mutex.Unlock()
+
 		sendProtobuf(dataMessage)
 	}
 }
