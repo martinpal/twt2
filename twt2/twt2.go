@@ -1126,19 +1126,33 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 	// Check if we're in server mode (no pool connections)
 	if len(app.PoolConnections) == 0 {
-		// Server mode - send directly through the protobuf connection
-		protobufConnectionMutex.RLock()
-		currentConn := protobufConnection
-		protobufConnectionMutex.RUnlock()
+		// Server mode - use load balancing across client connections
+		serverClientMutex.RLock()
+		availableConnections := make([]*ServerClientConnection, 0)
+		for _, clientConn := range serverClientConnections {
+			if clientConn.Active && clientConn.Conn != nil {
+				availableConnections = append(availableConnections, clientConn)
+			}
+		}
+		serverClientMutex.RUnlock()
 
-		if currentConn != nil {
-			log.Tracef("Sending message via direct protobuf connection (server mode)")
-			sendProtobufToConn(currentConn, message)
-			return
-		} else {
-			log.Errorf("No protobuf connection available for server response")
+		if len(availableConnections) == 0 {
+			log.Errorf("No active server client connections available")
 			return
 		}
+
+		// Use LRU selection for server-side load balancing
+		selectedConn := availableConnections[0]
+		for _, clientConn := range availableConnections {
+			if clientConn.LastUsed.Before(selectedConn.LastUsed) {
+				selectedConn = clientConn
+			}
+		}
+
+		log.Tracef("Sending message via server client connection %d (LRU)", selectedConn.ID)
+		selectedConn.LastUsed = time.Now()
+		sendProtobufToConn(selectedConn.Conn, message)
+		return
 	}
 
 	// Client mode - use pool connections
@@ -1230,6 +1244,18 @@ var protobufConnection net.Conn          // Global variable to store the protobu
 var protobufConnectionMutex sync.RWMutex // Mutex to protect protobufConnection
 var protobufWriteMutex sync.Mutex        // Mutex to serialize protobuf writes and prevent frame corruption
 
+// Server-side client connection tracking for load balancing
+type ServerClientConnection struct {
+	Conn     net.Conn
+	ID       uint64
+	LastUsed time.Time
+	Active   bool
+}
+
+var serverClientConnections []*ServerClientConnection
+var serverClientMutex sync.RWMutex
+var nextServerClientID uint64
+
 // isTLSTraffic detects if the incoming data appears to be TLS/SSL traffic
 // TLS records have specific content types in the first byte
 func isTLSTraffic(header []byte) bool {
@@ -1264,7 +1290,37 @@ func handleConnectionWithPoolConn(conn net.Conn, poolConn *PoolConnection) {
 	protobufConnection = conn
 	protobufConnectionMutex.Unlock()
 
+	// Register this connection in server-side client pool for load balancing
+	var serverClientConn *ServerClientConnection
+	serverClientMutex.Lock()
+	serverClientConn = &ServerClientConnection{
+		Conn:     conn,
+		ID:       nextServerClientID,
+		LastUsed: time.Now(),
+		Active:   true,
+	}
+	serverClientConnections = append(serverClientConnections, serverClientConn)
+	nextServerClientID++
+	serverClientMutex.Unlock()
+	log.Debugf("Registered server client connection %d (total: %d)",
+		serverClientConn.ID, len(serverClientConnections))
+
 	defer func() {
+		// Remove this connection from server-side pool when it closes
+		if serverClientConn != nil {
+			serverClientMutex.Lock()
+			for i, conn := range serverClientConnections {
+				if conn.ID == serverClientConn.ID {
+					// Remove connection from slice
+					serverClientConnections = append(serverClientConnections[:i], serverClientConnections[i+1:]...)
+					break
+				}
+			}
+			serverClientMutex.Unlock()
+			log.Debugf("Unregistered server client connection %d (remaining: %d)",
+				serverClientConn.ID, len(serverClientConnections))
+		}
+
 		// Ensure connection is closed when this function exits
 		conn.Close()
 		log.Tracef("handleConnection exiting, connection closed")
