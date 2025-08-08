@@ -590,7 +590,7 @@ func TestHandleConnection_InvalidProtobufData(t *testing.T) {
 	// Add frame length header (little-endian)
 	frameLength := uint16(len(invalidProtobufData))
 	lengthBytes := []byte{byte(frameLength), byte(frameLength >> 8)}
-	
+
 	// Construct the complete frame
 	conn.readData = append(lengthBytes, invalidProtobufData...)
 
@@ -627,7 +627,7 @@ func TestHandleConnection_MultipleMessageTypes(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name:        "DATA_UP message", 
+			name:        "DATA_UP message",
 			messageType: twtproto.ProxyComm_DATA_UP,
 			expectError: false,
 		},
@@ -711,7 +711,7 @@ func TestHandleConnection_FrameLengthMismatch(t *testing.T) {
 	frameLength := uint16(100)
 	lengthBytes := []byte{byte(frameLength), byte(frameLength >> 8)}
 	shortData := make([]byte, 50) // Only 50 bytes instead of promised 100
-	
+
 	conn.readData = append(lengthBytes, shortData...)
 	conn.readError = errors.New("EOF") // Connection closes before expected data
 

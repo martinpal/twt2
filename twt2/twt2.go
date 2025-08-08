@@ -682,10 +682,12 @@ func clearConnectionState() {
 	app.RemoteConnectionMutex.Unlock()
 
 	// Clear the global protobuf connection
+	protobufConnectionMutex.Lock()
 	if protobufConnection != nil {
 		protobufConnection.Close()
 		protobufConnection = nil
 	}
+	protobufConnectionMutex.Unlock()
 
 	log.Infof("Cleared %d local and %d remote connections", localCount, remoteCount)
 }
@@ -874,7 +876,6 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 			sendProtobuf(dataMessage)
 		}
 	}
-	log.Infof("Close hijacked connection %4d", thisConnection)
 }
 
 func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
@@ -892,6 +893,10 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 	B := make([]byte, 0, 2+length)
 	B = append(B, size...)
 	B = append(B, data...)
+
+	// Serialize writes to prevent frame corruption from concurrent writes
+	protobufWriteMutex.Lock()
+	defer protobufWriteMutex.Unlock()
 
 	// Set write timeout to prevent blocking
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
@@ -914,9 +919,13 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	// Check if we're in server mode (no pool connections)
 	if len(app.PoolConnections) == 0 {
 		// Server mode - send directly through the protobuf connection
-		if protobufConnection != nil {
+		protobufConnectionMutex.RLock()
+		currentConn := protobufConnection
+		protobufConnectionMutex.RUnlock()
+
+		if currentConn != nil {
 			log.Tracef("Sending message via direct protobuf connection (server mode)")
-			sendProtobufToConn(protobufConnection, message)
+			sendProtobufToConn(currentConn, message)
 			return
 		} else {
 			log.Errorf("No protobuf connection available for server response")
@@ -1013,7 +1022,9 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 // protobuf server
 
-var protobufConnection net.Conn // Global variable to store the protobuf connection for server responses
+var protobufConnection net.Conn          // Global variable to store the protobuf connection for server responses
+var protobufConnectionMutex sync.RWMutex // Mutex to protect protobufConnection
+var protobufWriteMutex sync.Mutex        // Mutex to serialize protobuf writes and prevent frame corruption
 
 // isTLSTraffic detects if the incoming data appears to be TLS/SSL traffic
 // TLS records have specific content types in the first byte
@@ -1041,7 +1052,9 @@ func getByteOrZero(data []byte, index int) byte {
 
 func handleConnection(conn net.Conn) {
 	// Store the connection for server responses
+	protobufConnectionMutex.Lock()
 	protobufConnection = conn
+	protobufConnectionMutex.Unlock()
 
 	defer func() {
 		// Ensure connection is closed when this function exits
