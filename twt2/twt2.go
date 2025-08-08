@@ -1145,21 +1145,19 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	app.PoolMutex.Lock()
 	defer app.PoolMutex.Unlock()
 
-	// Find a healthy available pool connection
+	// Find a healthy available pool connection using priority-based selection with LRU
 	var selectedConn *PoolConnection
 	var healthyConnections []*PoolConnection
 
-	// First pass - find healthy, available connections
+	// First pass - collect all healthy, available connections (highest priority)
 	for _, poolConn := range app.PoolConnections {
 		if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy && !poolConn.InUse {
 			healthyConnections = append(healthyConnections, poolConn)
-			selectedConn = poolConn
-			break
 		}
 	}
 
-	// Second pass - if no available connections, use healthy but busy ones
-	if selectedConn == nil && len(healthyConnections) == 0 {
+	// Second pass - if no available connections, collect healthy but busy ones
+	if len(healthyConnections) == 0 {
 		for _, poolConn := range app.PoolConnections {
 			if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy {
 				healthyConnections = append(healthyConnections, poolConn)
@@ -1167,8 +1165,8 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 		}
 	}
 
-	// Third pass - if no healthy connections, use any available connections
-	if selectedConn == nil && len(healthyConnections) == 0 {
+	// Third pass - if no healthy connections, collect any available connections
+	if len(healthyConnections) == 0 {
 		for _, poolConn := range app.PoolConnections {
 			if poolConn != nil && poolConn.Conn != nil && !poolConn.InUse {
 				healthyConnections = append(healthyConnections, poolConn)
@@ -1176,8 +1174,8 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 		}
 	}
 
-	// Fourth pass - if still no connections, use any connection with a valid Conn
-	if selectedConn == nil && len(healthyConnections) == 0 {
+	// Fourth pass - if still no connections, collect any connection with a valid Conn
+	if len(healthyConnections) == 0 {
 		for _, poolConn := range app.PoolConnections {
 			if poolConn != nil && poolConn.Conn != nil {
 				healthyConnections = append(healthyConnections, poolConn)
@@ -1185,8 +1183,8 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 		}
 	}
 
-	// Use least recently used from healthy connections
-	if selectedConn == nil && len(healthyConnections) > 0 {
+	// Always use least recently used (LRU) selection from collected connections
+	if len(healthyConnections) > 0 {
 		selectedConn = healthyConnections[0]
 		for _, poolConn := range healthyConnections {
 			if poolConn.LastUsed.Before(selectedConn.LastUsed) {

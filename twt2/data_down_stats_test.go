@@ -19,8 +19,14 @@ func TestDataDownStatsTracking(t *testing.T) {
 	if serverStats.MessageCounts == nil {
 		serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
 	}
+	// Reset all message counts
+	for k := range serverStats.MessageCounts {
+		serverStats.MessageCounts[k] = 0
+	}
 	serverStats.TotalBytesDown = 0
+	serverStats.TotalBytesUp = 0
 	serverStats.TotalMessagesProcessed = 0
+	serverStats.TotalConnectionsHandled = 0
 	serverStats.mutex.Unlock()
 
 	// Create test app with pool connections (client side)
@@ -110,8 +116,14 @@ func TestDataDownStatsServerSide(t *testing.T) {
 	if serverStats.MessageCounts == nil {
 		serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
 	}
+	// Reset all message counts
+	for k := range serverStats.MessageCounts {
+		serverStats.MessageCounts[k] = 0
+	}
 	serverStats.TotalBytesDown = 0
+	serverStats.TotalBytesUp = 0
 	serverStats.TotalMessagesProcessed = 0
+	serverStats.TotalConnectionsHandled = 0
 	serverStats.mutex.Unlock()
 
 	// Create test app without pool connections (server side)
@@ -179,8 +191,14 @@ func TestDataDownStatsComparison(t *testing.T) {
 		if serverStats.MessageCounts == nil {
 			serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
 		}
+		// Reset all message counts
+		for k := range serverStats.MessageCounts {
+			serverStats.MessageCounts[k] = 0
+		}
 		serverStats.TotalBytesDown = 0
+		serverStats.TotalBytesUp = 0
 		serverStats.TotalMessagesProcessed = 0
+		serverStats.TotalConnectionsHandled = 0
 		serverStats.mutex.Unlock()
 
 		// Create client-side app
@@ -203,6 +221,7 @@ func TestDataDownStatsComparison(t *testing.T) {
 		message := &twtproto.ProxyComm{
 			Mt:         twtproto.ProxyComm_DATA_DOWN,
 			Connection: 1,
+			Seq:        0, // Explicit seq value
 			Data:       []byte("client test data"),
 		}
 
@@ -210,7 +229,7 @@ func TestDataDownStatsComparison(t *testing.T) {
 		mockConn := newMockConn()
 		app.LocalConnections[1] = Connection{
 			Connection:   mockConn,
-			NextSeqOut:   1,
+			NextSeqOut:   0, // Match message Seq
 			MessageQueue: make(map[uint64]*twtproto.ProxyComm),
 		}
 
@@ -238,8 +257,14 @@ func TestDataDownStatsComparison(t *testing.T) {
 		if serverStats.MessageCounts == nil {
 			serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
 		}
+		// Reset all message counts
+		for k := range serverStats.MessageCounts {
+			serverStats.MessageCounts[k] = 0
+		}
 		serverStats.TotalBytesDown = 0
+		serverStats.TotalBytesUp = 0
 		serverStats.TotalMessagesProcessed = 0
+		serverStats.TotalConnectionsHandled = 0
 		serverStats.mutex.Unlock()
 
 		// Create server-side app (no pool connections)
@@ -255,6 +280,7 @@ func TestDataDownStatsComparison(t *testing.T) {
 		message := &twtproto.ProxyComm{
 			Mt:         twtproto.ProxyComm_DATA_DOWN,
 			Connection: 1,
+			Seq:        0, // Explicit seq value
 			Data:       []byte("server test data"),
 		}
 
@@ -262,7 +288,7 @@ func TestDataDownStatsComparison(t *testing.T) {
 		mockConn := newMockConn()
 		app.LocalConnections[1] = Connection{
 			Connection:   mockConn,
-			NextSeqOut:   1,
+			NextSeqOut:   0, // Match message Seq
 			MessageQueue: make(map[uint64]*twtproto.ProxyComm),
 		}
 
