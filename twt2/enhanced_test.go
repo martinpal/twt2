@@ -569,6 +569,167 @@ func TestHandleConnection_ValidMessages(t *testing.T) {
 	}
 }
 
+// Test handleConnection with invalid protobuf data (wire-format errors)
+func TestHandleConnection_InvalidProtobufData(t *testing.T) {
+	conn := newMockConn()
+
+	// Create a frame with valid length but invalid protobuf data
+	// This simulates the real-world scenario from the error logs
+	invalidProtobufData := []byte{
+		0x0d, 0x20, 0x01, 0x3a, 0x80, 0x0a, 0xbc, 0x3d,
+		0x6e, 0xac, 0xe0, 0xd7, 0x3a, 0x93, 0xc8, 0x31,
+		0x4a, 0x16, 0xb0, 0x59, 0xed, 0x2f, 0xeb, 0x4f,
+		0x54, 0x2c, 0xb4, 0x8e, 0xe4, 0x5c, 0x6c, 0x31,
+		// Add more invalid protobuf data to reach a reasonable size
+		0x9b, 0x43, 0x1b, 0x9a, 0x2b, 0x4f, 0x39, 0xc1,
+		0xbe, 0x95, 0x94, 0xfd, 0x4a, 0x80, 0x3b, 0x7a,
+		0x2d, 0x3d, 0x74, 0xb5, 0x05, 0x95, 0x5f, 0xd4,
+		0xa9, 0xcb, 0x11, 0xa1, 0xa4, 0xf2, 0x09, 0x95,
+	}
+
+	// Add frame length header (little-endian)
+	frameLength := uint16(len(invalidProtobufData))
+	lengthBytes := []byte{byte(frameLength), byte(frameLength >> 8)}
+	
+	// Construct the complete frame
+	conn.readData = append(lengthBytes, invalidProtobufData...)
+
+	// This should detect the protobuf parsing error and exit gracefully
+	done := make(chan bool, 1)
+	go func() {
+		handleConnection(conn)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Good - function exited due to protobuf parsing error
+	case <-time.After(5 * time.Second):
+		t.Error("handleConnection should have exited due to invalid protobuf data")
+	}
+
+	// Verify connection was closed
+	if !conn.closed {
+		t.Error("Connection should be closed after protobuf parsing error")
+	}
+}
+
+// Test handleConnection with multiple message scenarios
+func TestHandleConnection_MultipleMessageTypes(t *testing.T) {
+	tests := []struct {
+		name        string
+		messageType twtproto.ProxyComm_MessageType
+		expectError bool
+	}{
+		{
+			name:        "PING message",
+			messageType: twtproto.ProxyComm_PING,
+			expectError: false,
+		},
+		{
+			name:        "DATA_UP message", 
+			messageType: twtproto.ProxyComm_DATA_UP,
+			expectError: false,
+		},
+		{
+			name:        "DATA_DOWN message",
+			messageType: twtproto.ProxyComm_DATA_DOWN,
+			expectError: false,
+		},
+		{
+			name:        "OPEN_CONN message",
+			messageType: twtproto.ProxyComm_OPEN_CONN,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := newMockConn()
+
+			// Create message of specified type
+			message := &twtproto.ProxyComm{
+				Mt:         tt.messageType,
+				Proxy:      0,
+				Connection: 123,
+				Seq:        1,
+				Address:    "example.com",
+				Port:       80,
+				Data:       []byte("test data"),
+			}
+
+			conn.addProtobufMessage(message)
+			conn.readError = errors.New("EOF") // Make it exit after processing
+
+			// Process the message
+			done := make(chan bool, 1)
+			go func() {
+				handleConnection(conn)
+				done <- true
+			}()
+
+			select {
+			case <-done:
+				// Good - message was processed
+			case <-time.After(5 * time.Second):
+				t.Errorf("handleConnection should have processed %s message", tt.name)
+			}
+		})
+	}
+}
+
+// Test handleConnection with partial frame data
+func TestHandleConnection_PartialFrameData(t *testing.T) {
+	conn := newMockConn()
+
+	// Create a scenario where we receive partial frame length
+	// This simulates network issues where data arrives in fragments
+	partialLengthData := []byte{0x10} // Only first byte of length
+	conn.readData = partialLengthData
+	conn.readError = errors.New("EOF") // Connection closes before complete frame
+
+	// This should handle partial data gracefully and exit
+	done := make(chan bool, 1)
+	go func() {
+		handleConnection(conn)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Good - function handled partial data and exited
+	case <-time.After(5 * time.Second):
+		t.Error("handleConnection should have exited gracefully with partial data")
+	}
+}
+
+// Test handleConnection with frame length mismatch
+func TestHandleConnection_FrameLengthMismatch(t *testing.T) {
+	conn := newMockConn()
+
+	// Create a frame with length header indicating 100 bytes but only provide 50
+	frameLength := uint16(100)
+	lengthBytes := []byte{byte(frameLength), byte(frameLength >> 8)}
+	shortData := make([]byte, 50) // Only 50 bytes instead of promised 100
+	
+	conn.readData = append(lengthBytes, shortData...)
+	conn.readError = errors.New("EOF") // Connection closes before expected data
+
+	// This should detect the length mismatch and exit gracefully
+	done := make(chan bool, 1)
+	go func() {
+		handleConnection(conn)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Good - function detected mismatch and exited
+	case <-time.After(5 * time.Second):
+		t.Error("handleConnection should have exited due to frame length mismatch")
+	}
+}
+
 // Test poolConnectionReceiver basic functionality
 func TestPoolConnectionReceiver_BasicFunctionality(t *testing.T) {
 	// This test verifies the function exists and can be referenced
