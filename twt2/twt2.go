@@ -583,7 +583,7 @@ func startConnectionHealthMonitor() {
 
 					// Check for stale connections (no activity for 10 minutes)
 					if time.Since(poolConn.LastHealthCheck) > 10*time.Minute {
-						log.Warnf("Pool connection %d appears stale (last check %v ago), checking channel queue",
+						log.Debugf("Pool connection %d appears stale (last check %v ago), checking channel queue",
 							poolConn.ID, time.Since(poolConn.LastHealthCheck))
 
 						// Check if send channel is getting full
@@ -1416,6 +1416,11 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 			dataLen = len(message.GetData())
 		}
 		poolConn.Stats.IncrementMessage(message.Mt, dataLen)
+	}
+
+	// Update health check timestamp when successfully receiving messages (indicates healthy connection)
+	if poolConn != nil {
+		poolConn.LastHealthCheck = time.Now()
 	}
 
 	// Marshal message back to show hexdump
