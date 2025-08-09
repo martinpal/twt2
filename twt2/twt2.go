@@ -978,11 +978,273 @@ func servePACFile(w http.ResponseWriter, r *http.Request) {
 	w.Write(pacContent)
 }
 
+// serveMetrics serves Prometheus-style metrics for monitoring
+func serveMetrics(w http.ResponseWriter, r *http.Request) {
+	log.Debugf("Serving metrics request from %s", r.RemoteAddr)
+
+	if app == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("# App not initialized\n"))
+		return
+	}
+
+	var metrics strings.Builder
+
+	// Check if this is client side (has pool connections) or server side
+	app.PoolMutex.Lock()
+	isClientSide := len(app.PoolConnections) > 0
+	app.PoolMutex.Unlock()
+
+	if isClientSide {
+		// Client-side metrics
+		generateClientMetrics(&metrics)
+	} else {
+		// Server-side metrics
+		generateServerMetrics(&metrics)
+	}
+
+	// Set appropriate headers for Prometheus metrics
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(metrics.String()))
+}
+
+// generateClientMetrics generates Prometheus metrics for client-side (pool connections)
+func generateClientMetrics(metrics *strings.Builder) {
+	app.PoolMutex.Lock()
+	defer app.PoolMutex.Unlock()
+
+	// Pool connection overview
+	totalConnections := len(app.PoolConnections)
+	healthyConnections := 0
+	inUseConnections := 0
+
+	for _, conn := range app.PoolConnections {
+		if conn != nil {
+			if conn.Healthy {
+				healthyConnections++
+			}
+			if conn.InUse {
+				inUseConnections++
+			}
+		}
+	}
+
+	// Connection pool overview metrics
+	metrics.WriteString("# HELP twt2_pool_connections_total Total number of pool connections\n")
+	metrics.WriteString("# TYPE twt2_pool_connections_total gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_pool_connections_total %d\n", totalConnections))
+
+	metrics.WriteString("# HELP twt2_pool_connections_healthy Number of healthy pool connections\n")
+	metrics.WriteString("# TYPE twt2_pool_connections_healthy gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_pool_connections_healthy %d\n", healthyConnections))
+
+	metrics.WriteString("# HELP twt2_pool_connections_in_use Number of pool connections currently in use\n")
+	metrics.WriteString("# TYPE twt2_pool_connections_in_use gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_pool_connections_in_use %d\n", inUseConnections))
+
+	// Per-connection metrics
+	metrics.WriteString("# HELP twt2_pool_connection_queue_length Current queue length for pool connection send channel\n")
+	metrics.WriteString("# TYPE twt2_pool_connection_queue_length gauge\n")
+
+	metrics.WriteString("# HELP twt2_pool_connection_queue_capacity Maximum queue capacity for pool connection send channel\n")
+	metrics.WriteString("# TYPE twt2_pool_connection_queue_capacity gauge\n")
+
+	metrics.WriteString("# HELP twt2_pool_connection_messages_total Total messages sent through pool connection\n")
+	metrics.WriteString("# TYPE twt2_pool_connection_messages_total counter\n")
+
+	metrics.WriteString("# HELP twt2_pool_connection_bytes_total Total bytes sent through pool connection\n")
+	metrics.WriteString("# TYPE twt2_pool_connection_bytes_total counter\n")
+
+	// Aggregate totals
+	var totalMessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
+	var totalBytesUp, totalBytesDown uint64
+
+	for _, conn := range app.PoolConnections {
+		if conn == nil {
+			continue
+		}
+
+		connID := strconv.FormatUint(conn.ID, 10)
+		healthyStatus := "0"
+		if conn.Healthy {
+			healthyStatus = "1"
+		}
+		inUseStatus := "0"
+		if conn.InUse {
+			inUseStatus = "1"
+		}
+
+		// Queue metrics
+		queueLength := len(conn.SendChan)
+		queueCapacity := cap(conn.SendChan)
+
+		metrics.WriteString(fmt.Sprintf("twt2_pool_connection_queue_length{connection_id=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+			connID, healthyStatus, inUseStatus, queueLength))
+		metrics.WriteString(fmt.Sprintf("twt2_pool_connection_queue_capacity{connection_id=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+			connID, healthyStatus, inUseStatus, queueCapacity))
+
+		// Connection statistics
+		if conn.Stats != nil {
+			counts, bytesUp, bytesDown, createdAt, lastMessageAt := conn.Stats.GetStats()
+
+			for msgType, count := range counts {
+				msgTypeName := strings.ToLower(msgType.String())
+				metrics.WriteString(fmt.Sprintf("twt2_pool_connection_messages_total{connection_id=\"%s\",message_type=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+					connID, msgTypeName, healthyStatus, inUseStatus, count))
+				totalMessageCounts[msgType] += count
+			}
+
+			metrics.WriteString(fmt.Sprintf("twt2_pool_connection_bytes_total{connection_id=\"%s\",direction=\"up\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+				connID, healthyStatus, inUseStatus, bytesUp))
+			metrics.WriteString(fmt.Sprintf("twt2_pool_connection_bytes_total{connection_id=\"%s\",direction=\"down\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+				connID, healthyStatus, inUseStatus, bytesDown))
+
+			totalBytesUp += bytesUp
+			totalBytesDown += bytesDown
+
+			// Connection timing metrics
+			metrics.WriteString("# HELP twt2_pool_connection_created_timestamp_seconds Unix timestamp when connection was created\n")
+			metrics.WriteString("# TYPE twt2_pool_connection_created_timestamp_seconds gauge\n")
+			metrics.WriteString(fmt.Sprintf("twt2_pool_connection_created_timestamp_seconds{connection_id=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+				connID, healthyStatus, inUseStatus, createdAt.Unix()))
+
+			metrics.WriteString("# HELP twt2_pool_connection_last_message_timestamp_seconds Unix timestamp of last message sent\n")
+			metrics.WriteString("# TYPE twt2_pool_connection_last_message_timestamp_seconds gauge\n")
+			metrics.WriteString(fmt.Sprintf("twt2_pool_connection_last_message_timestamp_seconds{connection_id=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+				connID, healthyStatus, inUseStatus, lastMessageAt.Unix()))
+		}
+
+		// Last health check and last used timing
+		metrics.WriteString("# HELP twt2_pool_connection_last_health_check_timestamp_seconds Unix timestamp of last health check\n")
+		metrics.WriteString("# TYPE twt2_pool_connection_last_health_check_timestamp_seconds gauge\n")
+		metrics.WriteString(fmt.Sprintf("twt2_pool_connection_last_health_check_timestamp_seconds{connection_id=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+			connID, healthyStatus, inUseStatus, conn.LastHealthCheck.Unix()))
+
+		metrics.WriteString("# HELP twt2_pool_connection_last_used_timestamp_seconds Unix timestamp when connection was last used\n")
+		metrics.WriteString("# TYPE twt2_pool_connection_last_used_timestamp_seconds gauge\n")
+		metrics.WriteString(fmt.Sprintf("twt2_pool_connection_last_used_timestamp_seconds{connection_id=\"%s\",healthy=\"%s\",in_use=\"%s\"} %d\n",
+			connID, healthyStatus, inUseStatus, conn.LastUsed.Unix()))
+	}
+
+	// Aggregate metrics
+	metrics.WriteString("# HELP twt2_messages_total Total messages processed by all pool connections\n")
+	metrics.WriteString("# TYPE twt2_messages_total counter\n")
+	for msgType, total := range totalMessageCounts {
+		msgTypeName := strings.ToLower(msgType.String())
+		metrics.WriteString(fmt.Sprintf("twt2_messages_total{message_type=\"%s\"} %d\n", msgTypeName, total))
+	}
+
+	metrics.WriteString("# HELP twt2_bytes_total Total bytes processed by all pool connections\n")
+	metrics.WriteString("# TYPE twt2_bytes_total counter\n")
+	metrics.WriteString(fmt.Sprintf("twt2_bytes_total{direction=\"up\"} %d\n", totalBytesUp))
+	metrics.WriteString(fmt.Sprintf("twt2_bytes_total{direction=\"down\"} %d\n", totalBytesDown))
+}
+
+// generateServerMetrics generates Prometheus metrics for server-side
+func generateServerMetrics(metrics *strings.Builder) {
+	// Get local and remote connection counts
+	app.LocalConnectionMutex.Lock()
+	localConnCount := len(app.LocalConnections)
+	app.LocalConnectionMutex.Unlock()
+
+	app.RemoteConnectionMutex.Lock()
+	remoteConnCount := len(app.RemoteConnections)
+	app.RemoteConnectionMutex.Unlock()
+
+	// Server client connections count
+	serverClientMutex.RLock()
+	serverClientCount := len(serverClientConnections)
+	activeServerClientCount := 0
+	for _, conn := range serverClientConnections {
+		if conn.Active {
+			activeServerClientCount++
+		}
+	}
+	serverClientMutex.RUnlock()
+
+	// Connection overview metrics
+	metrics.WriteString("# HELP twt2_server_local_connections_total Current number of local connections on server\n")
+	metrics.WriteString("# TYPE twt2_server_local_connections_total gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_local_connections_total %d\n", localConnCount))
+
+	metrics.WriteString("# HELP twt2_server_remote_connections_total Current number of remote connections on server\n")
+	metrics.WriteString("# TYPE twt2_server_remote_connections_total gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_remote_connections_total %d\n", remoteConnCount))
+
+	metrics.WriteString("# HELP twt2_server_client_connections_total Current number of client connections to server\n")
+	metrics.WriteString("# TYPE twt2_server_client_connections_total gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_client_connections_total %d\n", serverClientCount))
+
+	metrics.WriteString("# HELP twt2_server_client_connections_active Current number of active client connections to server\n")
+	metrics.WriteString("# TYPE twt2_server_client_connections_active gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_client_connections_active %d\n", activeServerClientCount))
+
+	// Get global server statistics
+	serverStats.mutex.RLock()
+	totalConnections := serverStats.TotalConnectionsHandled
+	totalMessages := serverStats.TotalMessagesProcessed
+	totalBytesUp := serverStats.TotalBytesUp
+	totalBytesDown := serverStats.TotalBytesDown
+	messageCounts := make(map[twtproto.ProxyComm_MessageType]uint64)
+	for k, v := range serverStats.MessageCounts {
+		messageCounts[k] = v
+	}
+	serverStats.mutex.RUnlock()
+
+	// Server statistics metrics
+	metrics.WriteString("# HELP twt2_server_connections_handled_total Total number of connections handled by server\n")
+	metrics.WriteString("# TYPE twt2_server_connections_handled_total counter\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_connections_handled_total %d\n", totalConnections))
+
+	metrics.WriteString("# HELP twt2_server_messages_processed_total Total number of messages processed by server\n")
+	metrics.WriteString("# TYPE twt2_server_messages_processed_total counter\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_messages_processed_total %d\n", totalMessages))
+
+	metrics.WriteString("# HELP twt2_server_bytes_total Total bytes processed by server\n")
+	metrics.WriteString("# TYPE twt2_server_bytes_total counter\n")
+	metrics.WriteString(fmt.Sprintf("twt2_server_bytes_total{direction=\"up\"} %d\n", totalBytesUp))
+	metrics.WriteString(fmt.Sprintf("twt2_server_bytes_total{direction=\"down\"} %d\n", totalBytesDown))
+
+	// Message type breakdown
+	metrics.WriteString("# HELP twt2_server_messages_by_type_total Total messages processed by server by message type\n")
+	metrics.WriteString("# TYPE twt2_server_messages_by_type_total counter\n")
+	for msgType, count := range messageCounts {
+		msgTypeName := strings.ToLower(msgType.String())
+		metrics.WriteString(fmt.Sprintf("twt2_server_messages_by_type_total{message_type=\"%s\"} %d\n", msgTypeName, count))
+	}
+
+	// Server client connection details
+	serverClientMutex.RLock()
+	metrics.WriteString("# HELP twt2_server_client_connection_last_used_timestamp_seconds Unix timestamp when server client connection was last used\n")
+	metrics.WriteString("# TYPE twt2_server_client_connection_last_used_timestamp_seconds gauge\n")
+	for _, conn := range serverClientConnections {
+		connID := strconv.FormatUint(conn.ID, 10)
+		activeStatus := "0"
+		if conn.Active {
+			activeStatus = "1"
+		}
+		metrics.WriteString(fmt.Sprintf("twt2_server_client_connection_last_used_timestamp_seconds{connection_id=\"%s\",active=\"%s\"} %d\n",
+			connID, activeStatus, conn.LastUsed.Unix()))
+	}
+	serverClientMutex.RUnlock()
+}
+
 // handleHTTPRequest handles HTTP requests (non-CONNECT) including PAC file requests
 func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	// Check if this is a PAC file request
 	if r.Method == "GET" && (r.URL.Path == "/proxy.pac" || r.URL.Path == "/wpad.dat") {
 		servePACFile(w, r)
+		return
+	}
+
+	// Check if this is a metrics request
+	if r.Method == "GET" && r.URL.Path == "/metrics" {
+		serveMetrics(w, r)
 		return
 	}
 
