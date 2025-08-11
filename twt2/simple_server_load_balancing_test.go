@@ -10,8 +10,15 @@ import (
 
 // TestServerSideLoadBalancingLogic tests the server-side load balancing without actual network I/O
 func TestServerSideLoadBalancingLogic(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() {
+		setApp(originalApp)
+		// Clean up server client connections
+		serverClientMutex.Lock()
+		serverClientConnections = []*ServerClientConnection{}
+		nextServerClientID = 0
+		serverClientMutex.Unlock()
+	}()
 
 	// Reset server-side client connections
 	serverClientMutex.Lock()
@@ -20,10 +27,10 @@ func TestServerSideLoadBalancingLogic(t *testing.T) {
 	serverClientMutex.Unlock()
 
 	// Create app in server mode (no pool connections)
-	app = &App{
+	setApp(&App{
 		PoolConnections: []*PoolConnection{}, // Empty = server mode
 		PoolMutex:       sync.Mutex{},
-	}
+	})
 
 	// Create mock server client connections with different LastUsed times
 	serverClientMutex.Lock()

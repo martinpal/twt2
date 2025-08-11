@@ -609,7 +609,7 @@ func TestHandleConnection_InvalidProtobufData(t *testing.T) {
 	}
 
 	// Verify connection was closed
-	if !conn.closed {
+	if !conn.IsClosed() {
 		t.Error("Connection should be closed after protobuf parsing error")
 	}
 }

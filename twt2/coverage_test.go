@@ -13,18 +13,18 @@ import (
 
 // Test newConnection function
 func TestNewConnection_Coverage(t *testing.T) {
-	originalApp := app
+	originalApp := getApp()
 	defer func() {
 		time.Sleep(100 * time.Millisecond) // Allow goroutines to complete
-		app = originalApp
+		setApp(originalApp)
 	}()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
 		PoolConnections:       []*PoolConnection{}, // Add this for server mode
 		PoolMutex:             sync.Mutex{},        // Add this for server mode
-	}
+	})
 
 	message := &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_OPEN_CONN,
@@ -39,9 +39,10 @@ func TestNewConnection_Coverage(t *testing.T) {
 	newConnection(message)
 
 	// Verify connection was created
-	app.RemoteConnectionMutex.Lock()
-	conn, exists := app.RemoteConnections[123]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	conn, exists := currentApp.RemoteConnections[123]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if !exists {
 		t.Error("Connection should have been created")
@@ -63,18 +64,18 @@ func TestNewConnection_Coverage(t *testing.T) {
 
 // Test newConnection with valid address and server mode
 func TestNewConnection_ServerMode(t *testing.T) {
-	originalApp := app
+	originalApp := getApp()
 	defer func() {
 		time.Sleep(200 * time.Millisecond) // Allow goroutines to complete
-		app = originalApp
+		setApp(originalApp)
 	}()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
 		PoolConnections:       []*PoolConnection{},
 		PoolMutex:             sync.Mutex{},
-	}
+	})
 
 	message := &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_OPEN_CONN,
@@ -89,9 +90,10 @@ func TestNewConnection_ServerMode(t *testing.T) {
 	newConnection(message)
 
 	// Verify connection was created
-	app.RemoteConnectionMutex.Lock()
-	conn, exists := app.RemoteConnections[123]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	conn, exists := currentApp.RemoteConnections[123]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if !exists {
 		t.Error("Connection should have been created")
@@ -113,15 +115,15 @@ func TestNewConnection_ServerMode(t *testing.T) {
 
 // Test newConnection with invalid address
 func TestNewConnection_InvalidAddress(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
 		PoolConnections:       []*PoolConnection{}, // Server mode
 		PoolMutex:             sync.Mutex{},
-	}
+	})
 
 	message := &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_OPEN_CONN,
@@ -136,9 +138,10 @@ func TestNewConnection_InvalidAddress(t *testing.T) {
 	newConnection(message)
 
 	// Connection should not be created due to dial failure
-	app.RemoteConnectionMutex.Lock()
-	_, exists := app.RemoteConnections[456]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	_, exists := currentApp.RemoteConnections[456]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if exists {
 		t.Error("Connection should not have been created for invalid address")
@@ -147,13 +150,13 @@ func TestNewConnection_InvalidAddress(t *testing.T) {
 
 // Test forwardDataChunk function
 func TestForwardDataChunk(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
 	// Create a mock connection
 	mockConn := newMockConn()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections: map[uint64]Connection{
 			789: {
 				Connection:   mockConn,
@@ -163,7 +166,7 @@ func TestForwardDataChunk(t *testing.T) {
 			},
 		},
 		RemoteConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	testData := []byte("Hello, World!")
 	message := &twtproto.ProxyComm{
@@ -183,9 +186,10 @@ func TestForwardDataChunk(t *testing.T) {
 	}
 
 	// Verify sequence number was incremented
-	app.RemoteConnectionMutex.Lock()
-	conn := app.RemoteConnections[789]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	conn := currentApp.RemoteConnections[789]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if conn.NextSeqOut != 2 {
 		t.Errorf("Expected NextSeqOut 2, got %d", conn.NextSeqOut)
@@ -194,13 +198,13 @@ func TestForwardDataChunk(t *testing.T) {
 
 // Test backwardDataChunk function
 func TestBackwardDataChunk(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
 	// Create a mock connection
 	mockConn := newMockConn()
 
-	app = &App{
+	setApp(&App{
 		LocalConnections: map[uint64]Connection{
 			999: {
 				Connection:   mockConn,
@@ -210,7 +214,7 @@ func TestBackwardDataChunk(t *testing.T) {
 			},
 		},
 		LocalConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	testData := []byte("Response data")
 	message := &twtproto.ProxyComm{
@@ -230,9 +234,10 @@ func TestBackwardDataChunk(t *testing.T) {
 	}
 
 	// Verify sequence number was incremented
-	app.LocalConnectionMutex.Lock()
-	conn := app.LocalConnections[999]
-	app.LocalConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.LocalConnectionMutex.Lock()
+	conn := currentApp.LocalConnections[999]
+	currentApp.LocalConnectionMutex.Unlock()
 
 	if conn.NextSeqOut != 2 {
 		t.Errorf("Expected NextSeqOut 2, got %d", conn.NextSeqOut)
@@ -241,10 +246,10 @@ func TestBackwardDataChunk(t *testing.T) {
 
 // Test handleRemoteSideConnection with EOF
 func TestHandleRemoteSideConnection_EOF(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections: map[uint64]Connection{
 			111: {
 				Connection:   nil, // Will be set below
@@ -256,18 +261,19 @@ func TestHandleRemoteSideConnection_EOF(t *testing.T) {
 		RemoteConnectionMutex: sync.Mutex{},
 		PoolConnections:       []*PoolConnection{}, // Server mode
 		PoolMutex:             sync.Mutex{},
-	}
+	})
 
 	// Create a mock connection that returns EOF
 	mockConn := newMockConn()
 	mockConn.readError = io.EOF
 
 	// Set the connection
-	app.RemoteConnectionMutex.Lock()
-	conn := app.RemoteConnections[111]
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	conn := currentApp.RemoteConnections[111]
 	conn.Connection = mockConn
-	app.RemoteConnections[111] = conn
-	app.RemoteConnectionMutex.Unlock()
+	currentApp.RemoteConnections[111] = conn
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	// Start handler
 	done := make(chan bool, 1)
@@ -285,9 +291,10 @@ func TestHandleRemoteSideConnection_EOF(t *testing.T) {
 	}
 
 	// Verify connection was removed
-	app.RemoteConnectionMutex.Lock()
-	_, exists := app.RemoteConnections[111]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp = getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	_, exists := currentApp.RemoteConnections[111]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if exists {
 		t.Error("Connection should have been removed after EOF")
@@ -296,10 +303,10 @@ func TestHandleRemoteSideConnection_EOF(t *testing.T) {
 
 // Test handleRemoteSideConnection with data
 func TestHandleRemoteSideConnection_WithData(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections: map[uint64]Connection{
 			222: {
 				Connection:   nil, // Will be set below
@@ -311,7 +318,7 @@ func TestHandleRemoteSideConnection_WithData(t *testing.T) {
 		RemoteConnectionMutex: sync.Mutex{},
 		PoolConnections:       []*PoolConnection{}, // Server mode
 		PoolMutex:             sync.Mutex{},
-	}
+	})
 
 	// Create a mock connection with data
 	mockConn := newMockConn()
@@ -327,11 +334,12 @@ func TestHandleRemoteSideConnection_WithData(t *testing.T) {
 	}()
 
 	// Set the connection
-	app.RemoteConnectionMutex.Lock()
-	conn := app.RemoteConnections[222]
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	conn := currentApp.RemoteConnections[222]
 	conn.Connection = mockConn
-	app.RemoteConnections[222] = conn
-	app.RemoteConnectionMutex.Unlock()
+	currentApp.RemoteConnections[222] = conn
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	// Start handler
 	done := make(chan bool, 1)
@@ -349,9 +357,10 @@ func TestHandleRemoteSideConnection_WithData(t *testing.T) {
 	}
 
 	// Verify sequence number was updated
-	app.RemoteConnectionMutex.Lock()
-	_, exists := app.RemoteConnections[222]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp = getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	_, exists := currentApp.RemoteConnections[222]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if exists {
 		t.Error("Connection should have been removed after EOF")
@@ -360,12 +369,12 @@ func TestHandleRemoteSideConnection_WithData(t *testing.T) {
 
 // Test Hijack function with different scenarios
 func TestHijack_MethodNotAllowed(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		ProxyAuthEnabled: false,
-	}
+	})
 
 	// Create request with invalid method
 	req, _ := http.NewRequest("POST", "http://example.com", nil)
@@ -380,17 +389,17 @@ func TestHijack_MethodNotAllowed(t *testing.T) {
 
 // Test Hijack function successful CONNECT
 func TestHijack_SuccessfulConnect(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		ProxyAuthEnabled:     false,
 		LocalConnections:     make(map[uint64]Connection),
 		LocalConnectionMutex: sync.Mutex{},
 		LastLocalConnection:  0,
 		PoolConnections:      []*PoolConnection{}, // Server mode
 		PoolMutex:            sync.Mutex{},
-	}
+	})
 
 	// Create CONNECT request with proper Host header
 	req, _ := http.NewRequest("CONNECT", "", nil)
@@ -408,7 +417,7 @@ func TestHijack_SuccessfulConnect(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify hijack was called
-	if !w.hijackCalled {
+	if !w.WasHijackCalled() {
 		t.Error("Hijack should have been called")
 	}
 
@@ -417,8 +426,12 @@ func TestHijack_SuccessfulConnect(t *testing.T) {
 	}
 
 	// Close the connection to make Hijack exit
-	if w.hijackConn != nil {
-		w.hijackConn.Close()
+	w.mu.Lock()
+	hijackConn := w.hijackConn
+	w.mu.Unlock()
+
+	if hijackConn != nil {
+		hijackConn.Close()
 	}
 
 	select {
@@ -443,15 +456,15 @@ func TestProtobufServer_StartupValidation(t *testing.T) {
 
 // Test handleProxycommMessage with different message types
 func TestHandleProxycommMessage_PingMessage(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		LocalConnections:      make(map[uint64]Connection),
 		RemoteConnections:     make(map[uint64]Connection),
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	message := &twtproto.ProxyComm{
 		Mt:    twtproto.ProxyComm_PING,
@@ -465,16 +478,16 @@ func TestHandleProxycommMessage_PingMessage(t *testing.T) {
 
 // Test handleProxycommMessage with OPEN_CONN
 func TestHandleProxycommMessage_OpenConn_Coverage(t *testing.T) {
-	originalApp := app
+	originalApp := getApp()
 	defer func() {
 		time.Sleep(200 * time.Millisecond) // Allow goroutines to complete
-		app = originalApp
+		setApp(originalApp)
 	}()
 
-	app = &App{
+	setApp(&App{
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	message := &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_OPEN_CONN,
@@ -492,9 +505,10 @@ func TestHandleProxycommMessage_OpenConn_Coverage(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify connection was created
-	app.RemoteConnectionMutex.Lock()
-	conn, exists := app.RemoteConnections[333]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.RemoteConnectionMutex.Lock()
+	conn, exists := currentApp.RemoteConnections[333]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if !exists {
 		t.Error("Remote connection should have been created")
@@ -508,10 +522,10 @@ func TestHandleProxycommMessage_OpenConn_Coverage(t *testing.T) {
 
 // Test message queueing in handleProxycommMessage
 func TestHandleProxycommMessage_MessageQueue(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
-	app = &App{
+	setApp(&App{
 		LocalConnections: map[uint64]Connection{
 			444: {
 				Connection:   newMockConn(),
@@ -521,7 +535,7 @@ func TestHandleProxycommMessage_MessageQueue(t *testing.T) {
 			},
 		},
 		LocalConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	// Send message with sequence 2 (out of order)
 	message := &twtproto.ProxyComm{
@@ -535,9 +549,10 @@ func TestHandleProxycommMessage_MessageQueue(t *testing.T) {
 	handleProxycommMessage(message)
 
 	// Verify message was queued
-	app.LocalConnectionMutex.Lock()
-	conn := app.LocalConnections[444]
-	app.LocalConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.LocalConnectionMutex.Lock()
+	conn := currentApp.LocalConnections[444]
+	currentApp.LocalConnectionMutex.Unlock()
 
 	if len(conn.MessageQueue) != 1 {
 		t.Errorf("Expected 1 queued message, got %d", len(conn.MessageQueue))
@@ -555,13 +570,13 @@ func TestHandleProxycommMessage_MessageQueue(t *testing.T) {
 
 // Test closeConnectionLocal and closeConnectionRemote
 func TestCloseConnections(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
 	localConn := newMockConn()
 	remoteConn := newMockConn()
 
-	app = &App{
+	setApp(&App{
 		LocalConnections: map[uint64]Connection{
 			555: {
 				Connection:   localConn,
@@ -580,7 +595,7 @@ func TestCloseConnections(t *testing.T) {
 		},
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	// Test closing local connection
 	localMessage := &twtproto.ProxyComm{
@@ -593,9 +608,10 @@ func TestCloseConnections(t *testing.T) {
 	closeConnectionLocal(localMessage)
 
 	// Verify local connection was removed
-	app.LocalConnectionMutex.Lock()
-	_, exists := app.LocalConnections[555]
-	app.LocalConnectionMutex.Unlock()
+	currentApp := getApp()
+	currentApp.LocalConnectionMutex.Lock()
+	_, exists := currentApp.LocalConnections[555]
+	currentApp.LocalConnectionMutex.Unlock()
 
 	if exists {
 		t.Error("Local connection should have been removed")
@@ -612,9 +628,9 @@ func TestCloseConnections(t *testing.T) {
 	closeConnectionRemote(remoteMessage)
 
 	// Verify remote connection was removed
-	app.RemoteConnectionMutex.Lock()
-	_, exists = app.RemoteConnections[666]
-	app.RemoteConnectionMutex.Unlock()
+	currentApp.RemoteConnectionMutex.Lock()
+	_, exists = currentApp.RemoteConnections[666]
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	if exists {
 		t.Error("Remote connection should have been removed")
@@ -623,17 +639,17 @@ func TestCloseConnections(t *testing.T) {
 
 // Test sendProtobuf in server mode
 func TestSendProtobuf_ServerMode_Coverage(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
 	// Set up server mode (no pool connections)
 	mockConn := newMockConn()
 	protobufConnection = mockConn
 
-	app = &App{
+	setApp(&App{
 		PoolConnections: []*PoolConnection{}, // Empty = server mode
 		PoolMutex:       sync.Mutex{},
-	}
+	})
 
 	message := &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_PING,

@@ -94,11 +94,7 @@ func TestHandleConnection_TLSDetection(t *testing.T) {
 	handleConnection(mockConn)
 
 	// Verify the connection was closed
-	mockConn.mu.Lock()
-	closed := mockConn.closed
-	mockConn.mu.Unlock()
-
-	if !closed {
+	if !mockConn.IsClosed() {
 		t.Error("Expected connection to be closed after detecting TLS traffic")
 	}
 }

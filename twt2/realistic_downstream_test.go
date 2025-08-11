@@ -26,7 +26,7 @@ func TestRealisticDownstreamBalancing(t *testing.T) {
 	serverStats.mutex.Unlock()
 
 	// Create app with multiple healthy pool connections (server side)
-	app = &App{
+	setApp(&App{
 		PoolConnections: []*PoolConnection{
 			{
 				ID:              0,
@@ -62,18 +62,19 @@ func TestRealisticDownstreamBalancing(t *testing.T) {
 		PoolMutex:             sync.Mutex{},
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
-	}
+	})
 
 	// Simulate remote connections - add them to app state like real server would
+	currentApp := getApp()
 	for connID := uint64(100); connID < 103; connID++ {
-		app.RemoteConnectionMutex.Lock()
-		app.RemoteConnections[connID] = Connection{
+		currentApp.RemoteConnectionMutex.Lock()
+		currentApp.RemoteConnections[connID] = Connection{
 			Connection:   newMockConn(),
 			LastSeqIn:    0,
 			NextSeqOut:   0,
 			MessageQueue: make(map[uint64]*twtproto.ProxyComm),
 		}
-		app.RemoteConnectionMutex.Unlock()
+		currentApp.RemoteConnectionMutex.Unlock()
 	}
 
 	// Track which pool connections receive DATA_DOWN messages
@@ -84,12 +85,12 @@ func TestRealisticDownstreamBalancing(t *testing.T) {
 	for connID := uint64(100); connID < 103; connID++ {
 		for chunk := 0; chunk < 3; chunk++ {
 			// Simulate receiving data from remote connection
-			app.RemoteConnectionMutex.Lock()
-			connRecord := app.RemoteConnections[connID]
+			currentApp.RemoteConnectionMutex.Lock()
+			connRecord := currentApp.RemoteConnections[connID]
 			seq := connRecord.LastSeqIn
 			connRecord.LastSeqIn++
-			app.RemoteConnections[connID] = connRecord
-			app.RemoteConnectionMutex.Unlock()
+			currentApp.RemoteConnections[connID] = connRecord
+			currentApp.RemoteConnectionMutex.Unlock()
 
 			// Create DATA_DOWN message like the server does
 			dataMessage := &twtproto.ProxyComm{
@@ -109,7 +110,7 @@ func TestRealisticDownstreamBalancing(t *testing.T) {
 			sendProtobuf(dataMessage)
 
 			// Check which pool connection received the message
-			for _, poolConn := range app.PoolConnections {
+			for _, poolConn := range currentApp.PoolConnections {
 				select {
 				case receivedMsg := <-poolConn.SendChan:
 					connectionUsage[poolConn.ID]++

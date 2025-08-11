@@ -27,6 +27,20 @@ const proxyID = 0
 const chunkSize = 1280
 
 var app *App
+var appMutex sync.RWMutex
+
+// Helper functions for safe app access
+func getApp() *App {
+	appMutex.RLock()
+	defer appMutex.RUnlock()
+	return app
+}
+
+func setApp(newApp *App) {
+	appMutex.Lock()
+	defer appMutex.Unlock()
+	app = newApp
+}
 
 // Global statistics for server-side tracking
 var serverStats struct {
@@ -809,11 +823,12 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 		}
 
 		// Attempt to recreate the connection
-		if app != nil {
-			newPoolConn := createPoolConnection(poolConn.ID, app.PeerHost, app.PeerPort, app.Ping, app.SSHUser, app.SSHKeyPath, app.SSHPort)
+		currentApp := getApp()
+		if currentApp != nil {
+			newPoolConn := createPoolConnection(poolConn.ID, currentApp.PeerHost, currentApp.PeerPort, currentApp.Ping, currentApp.SSHUser, currentApp.SSHKeyPath, currentApp.SSHPort)
 			if newPoolConn != nil {
 				// Update the pool connection with new connection details
-				app.PoolMutex.Lock()
+				currentApp.PoolMutex.Lock()
 				poolConn.Conn = newPoolConn.Conn
 				poolConn.SSHClient = newPoolConn.SSHClient
 				poolConn.SSHConn = newPoolConn.SSHConn
@@ -821,7 +836,7 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				poolConn.LastUsed = time.Now()
 				poolConn.Healthy = true // Mark as healthy after successful reconnection
 				poolConn.LastHealthCheck = time.Now()
-				app.PoolMutex.Unlock()
+				currentApp.PoolMutex.Unlock()
 
 				log.Infof("Pool connection %d successfully connected", poolConn.ID)
 
@@ -832,7 +847,8 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				reconnectDelay = 1 * time.Second
 
 				// Send ping if enabled
-				if app.Ping {
+				currentPingApp := getApp() // Use safe app access
+				if currentPingApp != nil && currentPingApp.Ping {
 					pingMessage := &twtproto.ProxyComm{
 						Mt:    twtproto.ProxyComm_PING,
 						Proxy: proxyID,
@@ -861,33 +877,34 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 
 // clearConnectionState clears potentially corrupted connection state
 func clearConnectionState() {
-	if app == nil {
+	currentApp := getApp() // Use safe app access
+	if currentApp == nil {
 		return
 	}
 
 	log.Warnf("Clearing connection state due to connection failure")
 
 	// Clear local connections (client side)
-	app.LocalConnectionMutex.Lock()
-	localCount := len(app.LocalConnections)
-	for connID, conn := range app.LocalConnections {
+	currentApp.LocalConnectionMutex.Lock()
+	localCount := len(currentApp.LocalConnections)
+	for connID, conn := range currentApp.LocalConnections {
 		if conn.Connection != nil {
 			conn.Connection.Close()
 		}
-		delete(app.LocalConnections, connID)
+		delete(currentApp.LocalConnections, connID)
 	}
-	app.LocalConnectionMutex.Unlock()
+	currentApp.LocalConnectionMutex.Unlock()
 
 	// Clear remote connections (server side)
-	app.RemoteConnectionMutex.Lock()
-	remoteCount := len(app.RemoteConnections)
-	for connID, conn := range app.RemoteConnections {
+	currentApp.RemoteConnectionMutex.Lock()
+	remoteCount := len(currentApp.RemoteConnections)
+	for connID, conn := range currentApp.RemoteConnections {
 		if conn.Connection != nil {
 			conn.Connection.Close()
 		}
-		delete(app.RemoteConnections, connID)
+		delete(currentApp.RemoteConnections, connID)
 	}
-	app.RemoteConnectionMutex.Unlock()
+	currentApp.RemoteConnectionMutex.Unlock()
 
 	// Clear the global protobuf connection
 	protobufConnectionMutex.Lock()
@@ -1255,6 +1272,13 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func Hijack(w http.ResponseWriter, r *http.Request) {
+	// Check if app is initialized
+	if app == nil {
+		log.Errorf("App not initialized, cannot handle hijack request")
+		http.Error(w, "Service not available", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Handle GET requests (including PAC file requests)
 	if r.Method == "GET" {
 		handleHTTPRequest(w, r)
@@ -1381,13 +1405,14 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 
 func sendProtobuf(message *twtproto.ProxyComm) {
 	// Check if app is initialized
-	if app == nil {
+	currentApp := getApp()
+	if currentApp == nil {
 		log.Errorf("App not initialized, cannot send protobuf message")
 		return
 	}
 
 	// Check if we're in server mode (no pool connections)
-	if len(app.PoolConnections) == 0 {
+	if len(currentApp.PoolConnections) == 0 {
 		// Server mode - use load balancing across client connections
 		serverClientMutex.RLock()
 		availableConnections := make([]*ServerClientConnection, 0)
@@ -1399,6 +1424,17 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 		serverClientMutex.RUnlock()
 
 		if len(availableConnections) == 0 {
+			// Fallback to global protobuf connection if no client connections available
+			protobufConnectionMutex.RLock()
+			conn := protobufConnection
+			protobufConnectionMutex.RUnlock()
+
+			if conn != nil {
+				log.Tracef("Sending message via fallback protobuf connection")
+				sendProtobufToConn(conn, message)
+				return
+			}
+
 			log.Errorf("No active server client connections available")
 			return
 		}
@@ -1418,15 +1454,15 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	}
 
 	// Client mode - use pool connections
-	app.PoolMutex.Lock()
-	defer app.PoolMutex.Unlock()
+	currentApp.PoolMutex.Lock()
+	defer currentApp.PoolMutex.Unlock()
 
 	// Find a healthy available pool connection using priority-based selection with LRU
 	var selectedConn *PoolConnection
 	var healthyConnections []*PoolConnection
 
 	// First pass - collect all healthy, available connections (highest priority)
-	for _, poolConn := range app.PoolConnections {
+	for _, poolConn := range currentApp.PoolConnections {
 		if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy && !poolConn.InUse {
 			healthyConnections = append(healthyConnections, poolConn)
 		}
@@ -1434,7 +1470,7 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 	// Second pass - if no available connections, collect healthy but busy ones
 	if len(healthyConnections) == 0 {
-		for _, poolConn := range app.PoolConnections {
+		for _, poolConn := range currentApp.PoolConnections {
 			if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy {
 				healthyConnections = append(healthyConnections, poolConn)
 			}
@@ -1443,7 +1479,7 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 	// Third pass - if no healthy connections, collect any available connections
 	if len(healthyConnections) == 0 {
-		for _, poolConn := range app.PoolConnections {
+		for _, poolConn := range currentApp.PoolConnections {
 			if poolConn != nil && poolConn.Conn != nil && !poolConn.InUse {
 				healthyConnections = append(healthyConnections, poolConn)
 			}
@@ -1452,7 +1488,7 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 	// Fourth pass - if still no connections, collect any connection with a valid Conn
 	if len(healthyConnections) == 0 {
-		for _, poolConn := range app.PoolConnections {
+		for _, poolConn := range currentApp.PoolConnections {
 			if poolConn != nil && poolConn.Conn != nil {
 				healthyConnections = append(healthyConnections, poolConn)
 			}
@@ -1470,7 +1506,7 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 	}
 
 	if selectedConn == nil {
-		log.Errorf("No healthy pool connections available (total: %d)", len(app.PoolConnections))
+		log.Errorf("No healthy pool connections available (total: %d)", len(currentApp.PoolConnections))
 		return
 	}
 
@@ -1806,6 +1842,9 @@ func newConnection(message *twtproto.ProxyComm) {
 
 		// Track outgoing CLOSE_CONN_C messages on server side
 		serverStats.mutex.Lock()
+		if serverStats.MessageCounts == nil {
+			serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
+		}
 		serverStats.MessageCounts[twtproto.ProxyComm_CLOSE_CONN_C]++
 		serverStats.mutex.Unlock()
 
@@ -1914,6 +1953,9 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 
 				// Track outgoing CLOSE_CONN_C messages on server side
 				serverStats.mutex.Lock()
+				if serverStats.MessageCounts == nil {
+					serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
+				}
 				serverStats.MessageCounts[twtproto.ProxyComm_CLOSE_CONN_C]++
 				serverStats.mutex.Unlock()
 
@@ -1921,19 +1963,27 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 				return
 			}
 			log.Tracef("Error reading remote connection %d: %v, exiting goroutine", connID, err)
-			app.RemoteConnectionMutex.Lock()
-			delete(app.RemoteConnections, connID)
-			app.RemoteConnectionMutex.Unlock()
+			currentApp := getApp()
+			if currentApp != nil {
+				currentApp.RemoteConnectionMutex.Lock()
+				delete(currentApp.RemoteConnections, connID)
+				currentApp.RemoteConnectionMutex.Unlock()
+			}
 			conn.Close()
 			return
 		}
 		log.Tracef("Sending data from remote connection %4d downward, length %5d", connID, n)
-		app.RemoteConnectionMutex.Lock()
-		connRecord := app.RemoteConnections[connID]
+		currentApp := getApp()
+		if currentApp == nil {
+			conn.Close()
+			return
+		}
+		currentApp.RemoteConnectionMutex.Lock()
+		connRecord := currentApp.RemoteConnections[connID]
 		seq := connRecord.LastSeqIn
 		connRecord.LastSeqIn++
-		app.RemoteConnections[connID] = connRecord
-		app.RemoteConnectionMutex.Unlock()
+		currentApp.RemoteConnections[connID] = connRecord
+		currentApp.RemoteConnectionMutex.Unlock()
 		//    log.Tracef("%s", hex.Dump(b[:n]))
 		dataMessage := &twtproto.ProxyComm{
 			Mt:         twtproto.ProxyComm_DATA_DOWN,
@@ -1945,6 +1995,9 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 
 		// Track outgoing DATA_DOWN messages on server side
 		serverStats.mutex.Lock()
+		if serverStats.MessageCounts == nil {
+			serverStats.MessageCounts = make(map[twtproto.ProxyComm_MessageType]uint64)
+		}
 		serverStats.MessageCounts[twtproto.ProxyComm_DATA_DOWN]++
 		serverStats.mutex.Unlock()
 
