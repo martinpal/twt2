@@ -1753,7 +1753,7 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 		log.Tracef("Seq DOWN %d %d", message.Seq, thisConnection.NextSeqOut)
 		if message.Seq != thisConnection.NextSeqOut {
 			log.Tracef("Queueing message UP conn %d seq %d", message.Connection, message.Seq)
-			thisConnection.MessageQueue[message.Seq] = message
+			app.LocalConnections[message.Connection].MessageQueue[message.Seq] = message
 			mutex.Unlock()
 			return
 		}
@@ -1776,7 +1776,7 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 				return
 			}
 			log.Tracef("Queueing message UP conn %d seq %d", message.Connection, message.Seq)
-			thisConnection.MessageQueue[message.Seq] = message
+			app.RemoteConnections[message.Connection].MessageQueue[message.Seq] = message
 			mutex.Unlock()
 			return
 		}
