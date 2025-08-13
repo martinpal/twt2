@@ -16,7 +16,9 @@ go.work
 
 # Compiled binary
 main/tw2
+main/tw2-static
 main/twt2main
+twt2/twt2
 
 # IDE files
 .vscode/
