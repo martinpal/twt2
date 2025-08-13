@@ -331,7 +331,7 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 	log.Debug("Started connection pool statistics logging (every minute)")
 
 	// Set the global app variable so GetApp() returns the correct instance
-	app = appInstance
+	setApp(appInstance)
 	return app
 }
 
