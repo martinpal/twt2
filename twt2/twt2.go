@@ -1078,17 +1078,22 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // authenticateProxyRequest checks if the request has valid proxy authentication
 func authenticateProxyRequest(r *http.Request, username, password string) bool {
 	if username == "" && password == "" {
+		log.Debugf("No proxy authentication required (both username and password empty)")
 		return true // No authentication required
 	}
+
+	log.Debugf("Proxy authentication required - checking request headers")
 
 	// Get the Proxy-Authorization header
 	proxyAuth := r.Header.Get("Proxy-Authorization")
 	if proxyAuth == "" {
+		log.Debugf("No Proxy-Authorization header found in request")
 		return false
 	}
 
 	// Check if it's Basic authentication
 	if !strings.HasPrefix(proxyAuth, "Basic ") {
+		log.Debugf("Proxy-Authorization header is not Basic authentication")
 		return false
 	}
 
@@ -1096,12 +1101,14 @@ func authenticateProxyRequest(r *http.Request, username, password string) bool {
 	encoded := strings.TrimPrefix(proxyAuth, "Basic ")
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
+		log.Debugf("Failed to decode Proxy-Authorization header: %v", err)
 		return false
 	}
 
 	// Split username:password
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) != 2 {
+		log.Debugf("Invalid credential format in Proxy-Authorization header")
 		return false
 	}
 
@@ -1109,7 +1116,10 @@ func authenticateProxyRequest(r *http.Request, username, password string) bool {
 	usernameMatch := subtle.ConstantTimeCompare([]byte(credentials[0]), []byte(username)) == 1
 	passwordMatch := subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(password)) == 1
 
-	return usernameMatch && passwordMatch
+	success := usernameMatch && passwordMatch
+	log.Debugf("Proxy authentication result: %t", success)
+
+	return success
 }
 
 // sendProxyAuthRequired sends a 407 Proxy Authentication Required response
@@ -1450,6 +1460,8 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 
 	// Check proxy authentication if enabled
 	if currentApp.ProxyAuthEnabled {
+		log.Debugf("Proxy authentication enabled, checking credentials for %s from %s", r.Host, r.RemoteAddr)
+		log.Debugf("Configured username: '%s', password configured: %t", currentApp.ProxyUsername, currentApp.ProxyPassword != "")
 		if !authenticateProxyRequest(r, currentApp.ProxyUsername, currentApp.ProxyPassword) {
 			log.Warnf("Proxy authentication failed for %s from %s", r.Host, r.RemoteAddr)
 			sendProxyAuthRequired(w)

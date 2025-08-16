@@ -185,15 +185,18 @@ func main() {
 	}
 
 	// Determine authentication settings
-	proxyAuthEnabled := *proxyUser != "" || *proxyPass != ""
+	proxyAuthEnabled := *proxyUser != "" && *proxyPass != ""
+	if (*proxyUser != "" || *proxyPass != "") && !proxyAuthEnabled {
+		log.Fatal("Both -proxy-user and -proxy-pass must be provided for proxy authentication")
+	}
+
+	// Proxy authentication is only supported in client mode
+	if (*proxyUser != "" || *proxyPass != "") && !isClient {
+		log.Fatal("Proxy authentication parameters (-proxy-user, -proxy-pass) are only allowed in client mode, not server mode")
+	}
+
 	if proxyAuthEnabled && isClient {
-		if *proxyUser == "" || *proxyPass == "" {
-			log.Fatal("Both -proxy-user and -proxy-pass must be provided for proxy authentication")
-		}
 		log.Infof("Proxy authentication enabled for user: %s", *proxyUser)
-	} else if proxyAuthEnabled && !isClient {
-		log.Warn("Proxy authentication settings ignored in server mode")
-		proxyAuthEnabled = false
 	}
 
 	// PAC file configuration
