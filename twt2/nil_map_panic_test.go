@@ -36,6 +36,9 @@ func TestNilMapPanicFix(t *testing.T) {
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {}
 	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 5, false, true, "", "", 22, false, "", "", "")
 	defer func() {
+		if app != nil {
+			app.Stop()
+		}
 		app = nil
 	}()
 
@@ -187,6 +190,9 @@ func TestNilMapPanicFixConcurrent(t *testing.T) {
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {}
 	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 5, false, true, "", "", 22, false, "", "", "")
 	defer func() {
+		if app != nil {
+			app.Stop()
+		}
 		app = nil
 	}()
 
@@ -278,6 +284,9 @@ func TestNilMapPanicFixNewConnection(t *testing.T) {
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {}
 	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 5, false, true, "", "", 22, false, "", "", "")
 	defer func() {
+		if app != nil {
+			app.Stop()
+		}
 		app = nil
 	}()
 

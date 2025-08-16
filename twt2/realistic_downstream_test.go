@@ -10,8 +10,8 @@ import (
 
 // TestRealisticDownstreamBalancing simulates real server behavior with remote connections
 func TestRealisticDownstreamBalancing(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
 
 	// Initialize server stats to prevent race conditions
 	serverStats.mutex.Lock()

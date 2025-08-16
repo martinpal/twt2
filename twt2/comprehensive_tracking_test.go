@@ -79,8 +79,8 @@ func TestAllMessageTypesTracking(t *testing.T) {
 			Connection: 1,
 			Seq:        1,
 			Data:       msgTest.data,
-			Address:    "test.com", // For OPEN_CONN
-			Port:       80,         // For OPEN_CONN
+			Address:    "127.0.0.1", // For OPEN_CONN - use localhost for fast failure
+			Port:       9999,        // For OPEN_CONN - use a port that's likely closed for fast failure
 		}
 
 		// Get initial pool stats

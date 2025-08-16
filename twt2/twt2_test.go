@@ -201,6 +201,11 @@ func TestNewApp_ClientMode(t *testing.T) {
 
 	// Execute
 	app := NewApp(handler, listenPort, peerHost, peerPort, poolInit, poolCap, ping, isClient, sshUser, sshKeyPath, sshPort, false, "", "", "")
+	defer func() {
+		if app != nil {
+			app.Stop()
+		}
+	}()
 
 	// Assert
 	if app == nil {
@@ -258,6 +263,11 @@ func TestNewApp_ServerMode(t *testing.T) {
 
 	// Execute
 	app := NewApp(handler, listenPort, peerHost, peerPort, poolInit, poolCap, ping, isClient, sshUser, sshKeyPath, sshPort, false, "", "", "")
+	defer func() {
+		if app != nil {
+			app.Stop()
+		}
+	}()
 
 	// Assert
 	if app == nil {
@@ -1540,7 +1550,14 @@ func TestHandleConnection_FrameCorruption(t *testing.T) {
 
 // Test NewApp with different configurations to increase coverage
 func TestNewApp_ExtendedConfigurations(t *testing.T) {
+	var apps []*App
 	defer func() {
+		// Stop all created apps
+		for _, app := range apps {
+			if app != nil {
+				app.Stop()
+			}
+		}
 		StopAllPoolConnections()
 		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
 	}()
@@ -1549,18 +1566,21 @@ func TestNewApp_ExtendedConfigurations(t *testing.T) {
 
 	// Test with empty peer host (server mode)
 	app1 := NewApp(handler, 8080, "", 22, 0, 5, false, true, "user", "testkey", 22, false, "", "", "")
+	apps = append(apps, app1)
 	if len(app1.PoolConnections) != 0 {
 		t.Error("Expected no pool connections when peer host is empty")
 	}
 
 	// Test with non-client mode (should not create pool connections even with poolInit=2)
 	app2 := NewApp(handler, 8080, "example.com", 22, 0, 5, true, false, "user", "testkey", 22, false, "", "", "")
+	apps = append(apps, app2)
 	if len(app2.PoolConnections) != 0 {
 		t.Error("Expected no pool connections in server mode")
 	}
 
 	// Test with zero pool initialization
 	app3 := NewApp(handler, 8080, "example.com", 22, 0, 5, true, true, "user", "testkey", 22, false, "", "", "")
+	apps = append(apps, app3)
 	if len(app3.PoolConnections) != 0 {
 		t.Error("Expected no pool connections when poolInit is 0")
 	}
@@ -1666,6 +1686,9 @@ func TestProtobufServer_ExtendedScenarios(t *testing.T) {
 func TestConnectionCleanup(t *testing.T) {
 	originalApp := getApp()
 	defer func() {
+		if getApp() != nil && getApp() != originalApp {
+			getApp().Stop()
+		}
 		setApp(originalApp) // Use safe app setting
 		StopAllPoolConnections()
 		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
@@ -1677,6 +1700,8 @@ func TestConnectionCleanup(t *testing.T) {
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
 	}
+	// Create context for the test app to avoid nil pointer issues
+	testApp.ctx, testApp.cancel = context.WithCancel(context.Background())
 	setApp(testApp) // Use safe app setting
 
 	// Add connections with message queues
@@ -2019,6 +2044,9 @@ func TestApp_ServeHTTP_ProxyAuth(t *testing.T) {
 
 	defer func() {
 		// Restore original app state and stop any pool connections
+		if app != nil {
+			app.Stop()
+		}
 		app = originalApp
 		StopAllPoolConnections()
 		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
