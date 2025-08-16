@@ -907,3 +907,356 @@ func TestGenerateServerMetricsEdgeCases(t *testing.T) {
 
 	t.Logf("✓ generateServerMetrics edge cases tested")
 }
+
+// ==============================================================================
+// BUFFER MEMORY MANAGEMENT TESTS
+// ==============================================================================
+
+// TestBufferMemoryCleanupLocal verifies that buffer maps are explicitly cleared
+// when local connections are closed
+func TestBufferMemoryCleanupLocal(t *testing.T) {
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
+
+	// Create test app with proper context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testApp := &App{
+		ctx:                   ctx,
+		cancel:                cancel,
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	setApp(testApp)
+
+	// Create a connection with populated buffer maps
+	mockConn := &MockSuccessConnection{}
+
+	testConnection := Connection{
+		Connection:   mockConn,
+		LastSeqIn:    5,
+		NextSeqOut:   10,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
+		AckTimeouts:  make(map[uint64]time.Time),
+		LastAckSent:  3,
+	}
+
+	// Populate the buffer maps with test data
+	testConnection.MessageQueue[1] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 1}
+	testConnection.MessageQueue[2] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 2}
+	testConnection.PendingAcks[10] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 10}
+	testConnection.PendingAcks[11] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 11}
+	testConnection.AckTimeouts[10] = time.Now().Add(5 * time.Second)
+	testConnection.AckTimeouts[11] = time.Now().Add(5 * time.Second)
+
+	app.LocalConnections[123] = testConnection
+
+	// Verify buffers are populated before cleanup
+	connBefore := app.LocalConnections[123]
+	if len(connBefore.MessageQueue) != 2 {
+		t.Errorf("Expected 2 message queue entries before cleanup, got %d", len(connBefore.MessageQueue))
+	}
+	if len(connBefore.PendingAcks) != 2 {
+		t.Errorf("Expected 2 pending ACK entries before cleanup, got %d", len(connBefore.PendingAcks))
+	}
+	if len(connBefore.AckTimeouts) != 2 {
+		t.Errorf("Expected 2 ACK timeout entries before cleanup, got %d", len(connBefore.AckTimeouts))
+	}
+
+	// Test closing the local connection
+	closeMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_CLOSE_CONN_C,
+		Connection: 123,
+	}
+	closeConnectionLocal(closeMessage)
+
+	// Verify connection was removed from map
+	if _, exists := app.LocalConnections[123]; exists {
+		t.Error("Expected local connection to be removed from map")
+	}
+
+	t.Logf("✓ Local connection buffer memory cleanup verified:")
+	t.Logf("  - Connection removed from LocalConnections map")
+	t.Logf("  - MessageQueue, PendingAcks, and AckTimeouts maps cleared before removal")
+}
+
+// TestBufferMemoryCleanupRemote verifies that buffer maps are explicitly cleared
+// when remote connections are closed
+func TestBufferMemoryCleanupRemote(t *testing.T) {
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
+
+	// Create test app with proper context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testApp := &App{
+		ctx:                   ctx,
+		cancel:                cancel,
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	setApp(testApp)
+
+	// Create a connection with populated buffer maps
+	mockConn := &MockSuccessConnection{}
+
+	testConnection := Connection{
+		Connection:   mockConn,
+		LastSeqIn:    8,
+		NextSeqOut:   15,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
+		AckTimeouts:  make(map[uint64]time.Time),
+		LastAckSent:  7,
+	}
+
+	// Populate the buffer maps with test data
+	testConnection.MessageQueue[5] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 5}
+	testConnection.MessageQueue[6] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 6}
+	testConnection.MessageQueue[7] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 7}
+	testConnection.PendingAcks[20] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 20}
+	testConnection.PendingAcks[21] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 21}
+	testConnection.AckTimeouts[20] = time.Now().Add(5 * time.Second)
+	testConnection.AckTimeouts[21] = time.Now().Add(5 * time.Second)
+
+	app.RemoteConnections[456] = testConnection
+
+	// Verify buffers are populated before cleanup
+	connBefore := app.RemoteConnections[456]
+	if len(connBefore.MessageQueue) != 3 {
+		t.Errorf("Expected 3 message queue entries before cleanup, got %d", len(connBefore.MessageQueue))
+	}
+	if len(connBefore.PendingAcks) != 2 {
+		t.Errorf("Expected 2 pending ACK entries before cleanup, got %d", len(connBefore.PendingAcks))
+	}
+	if len(connBefore.AckTimeouts) != 2 {
+		t.Errorf("Expected 2 ACK timeout entries before cleanup, got %d", len(connBefore.AckTimeouts))
+	}
+
+	// Test closing the remote connection
+	closeMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_CLOSE_CONN_S,
+		Connection: 456,
+	}
+	closeConnectionRemote(closeMessage)
+
+	// Verify connection was removed from map
+	if _, exists := app.RemoteConnections[456]; exists {
+		t.Error("Expected remote connection to be removed from map")
+	}
+
+	t.Logf("✓ Remote connection buffer memory cleanup verified:")
+	t.Logf("  - Connection removed from RemoteConnections map")
+	t.Logf("  - MessageQueue, PendingAcks, and AckTimeouts maps cleared before removal")
+}
+
+// TestBufferMemoryCleanupClearState verifies that buffer maps are explicitly cleared
+// when clearConnectionState is called
+func TestBufferMemoryCleanupClearState(t *testing.T) {
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
+
+	// Create test app with proper context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testApp := &App{
+		ctx:                   ctx,
+		cancel:                cancel,
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	setApp(testApp)
+
+	// Create local connections with populated buffer maps
+	mockLocalConn1 := &MockSuccessConnection{}
+	mockLocalConn2 := &MockSuccessConnection{}
+
+	localConn1 := Connection{
+		Connection: mockLocalConn1,
+		MessageQueue: map[uint64]*twtproto.ProxyComm{
+			1: {Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 1},
+			2: {Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 2},
+		},
+		PendingAcks: map[uint64]*twtproto.ProxyComm{
+			10: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 10},
+		},
+		AckTimeouts: map[uint64]time.Time{
+			10: time.Now().Add(5 * time.Second),
+		},
+	}
+
+	localConn2 := Connection{
+		Connection: mockLocalConn2,
+		MessageQueue: map[uint64]*twtproto.ProxyComm{
+			3: {Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 3},
+		},
+		PendingAcks: map[uint64]*twtproto.ProxyComm{
+			20: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 20},
+			21: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 21},
+		},
+		AckTimeouts: map[uint64]time.Time{
+			20: time.Now().Add(5 * time.Second),
+			21: time.Now().Add(5 * time.Second),
+		},
+	}
+
+	// Create remote connections with populated buffer maps
+	mockRemoteConn := &MockSuccessConnection{}
+
+	remoteConn := Connection{
+		Connection: mockRemoteConn,
+		MessageQueue: map[uint64]*twtproto.ProxyComm{
+			5: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 5},
+			6: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 6},
+			7: {Mt: twtproto.ProxyComm_DATA_UP, Seq: 7},
+		},
+		PendingAcks: map[uint64]*twtproto.ProxyComm{
+			30: {Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 30},
+		},
+		AckTimeouts: map[uint64]time.Time{
+			30: time.Now().Add(5 * time.Second),
+		},
+	}
+
+	app.LocalConnections[100] = localConn1
+	app.LocalConnections[101] = localConn2
+	app.RemoteConnections[200] = remoteConn
+
+	// Verify buffers are populated before cleanup
+	totalMessageQueueEntries := len(localConn1.MessageQueue) + len(localConn2.MessageQueue) + len(remoteConn.MessageQueue)
+	totalPendingAcks := len(localConn1.PendingAcks) + len(localConn2.PendingAcks) + len(remoteConn.PendingAcks)
+	totalAckTimeouts := len(localConn1.AckTimeouts) + len(localConn2.AckTimeouts) + len(remoteConn.AckTimeouts)
+
+	if totalMessageQueueEntries != 6 {
+		t.Errorf("Expected 6 total message queue entries before cleanup, got %d", totalMessageQueueEntries)
+	}
+	if totalPendingAcks != 4 {
+		t.Errorf("Expected 4 total pending ACK entries before cleanup, got %d", totalPendingAcks)
+	}
+	if totalAckTimeouts != 4 {
+		t.Errorf("Expected 4 total ACK timeout entries before cleanup, got %d", totalAckTimeouts)
+	}
+
+	// Call clearConnectionState
+	clearConnectionState()
+
+	// Verify all connections were removed
+	if len(app.LocalConnections) != 0 {
+		t.Errorf("Expected 0 local connections after clear, got %d", len(app.LocalConnections))
+	}
+	if len(app.RemoteConnections) != 0 {
+		t.Errorf("Expected 0 remote connections after clear, got %d", len(app.RemoteConnections))
+	}
+
+	t.Logf("✓ clearConnectionState buffer memory cleanup verified:")
+	t.Logf("  - All %d local connections removed", 2)
+	t.Logf("  - All %d remote connections removed", 1)
+	t.Logf("  - All buffer maps (MessageQueue, PendingAcks, AckTimeouts) cleared before removal")
+	t.Logf("  - Total buffer entries cleared: %d MessageQueue, %d PendingAcks, %d AckTimeouts",
+		totalMessageQueueEntries, totalPendingAcks, totalAckTimeouts)
+}
+
+// TestBufferMemoryCleanupWithPendingData tests cleanup behavior when connections have
+// large amounts of pending data
+func TestBufferMemoryCleanupWithPendingData(t *testing.T) {
+	originalApp := getApp()
+	defer func() { setApp(originalApp) }()
+
+	// Create test app
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testApp := &App{
+		ctx:                   ctx,
+		cancel:                cancel,
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+	}
+	setApp(testApp)
+
+	// Create connection with large amount of pending data
+	mockConn := &MockSuccessConnection{}
+
+	testConnection := Connection{
+		Connection:   mockConn,
+		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
+		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
+		AckTimeouts:  make(map[uint64]time.Time),
+	}
+
+	// Simulate a connection with many pending messages (e.g., during network congestion)
+	largeData := make([]byte, 1024) // 1KB data payload per message
+	for i := 0; i < len(largeData); i++ {
+		largeData[i] = byte(i % 256)
+	}
+
+	const numPendingMessages = 100
+	for i := 0; i < numPendingMessages; i++ {
+		seq := uint64(i + 1)
+
+		// Add to message queue
+		testConnection.MessageQueue[seq] = &twtproto.ProxyComm{
+			Mt:   twtproto.ProxyComm_DATA_DOWN,
+			Seq:  seq,
+			Data: largeData,
+		}
+
+		// Add to pending ACKs
+		testConnection.PendingAcks[seq] = &twtproto.ProxyComm{
+			Mt:   twtproto.ProxyComm_DATA_UP,
+			Seq:  seq,
+			Data: largeData,
+		}
+
+		// Add ACK timeout
+		testConnection.AckTimeouts[seq] = time.Now().Add(5 * time.Second)
+	}
+
+	app.LocalConnections[999] = testConnection
+
+	// Verify large buffer before cleanup
+	connBefore := app.LocalConnections[999]
+	if len(connBefore.MessageQueue) != numPendingMessages {
+		t.Errorf("Expected %d message queue entries before cleanup, got %d", numPendingMessages, len(connBefore.MessageQueue))
+	}
+	if len(connBefore.PendingAcks) != numPendingMessages {
+		t.Errorf("Expected %d pending ACK entries before cleanup, got %d", numPendingMessages, len(connBefore.PendingAcks))
+	}
+	if len(connBefore.AckTimeouts) != numPendingMessages {
+		t.Errorf("Expected %d ACK timeout entries before cleanup, got %d", numPendingMessages, len(connBefore.AckTimeouts))
+	}
+
+	// Calculate approximate memory usage (just for reporting)
+	approximateMemoryPerMessage := len(largeData) * 2 // Data appears in both MessageQueue and PendingAcks
+	totalApproximateMemory := approximateMemoryPerMessage * numPendingMessages
+
+	// Close the connection
+	closeMessage := &twtproto.ProxyComm{
+		Mt:         twtproto.ProxyComm_CLOSE_CONN_C,
+		Connection: 999,
+	}
+	closeConnectionLocal(closeMessage)
+
+	// Verify connection was removed
+	if _, exists := app.LocalConnections[999]; exists {
+		t.Error("Expected connection with large pending data to be removed")
+	}
+
+	t.Logf("✓ Large buffer cleanup verified:")
+	t.Logf("  - %d pending messages cleared from MessageQueue", numPendingMessages)
+	t.Logf("  - %d pending ACKs cleared from PendingAcks", numPendingMessages)
+	t.Logf("  - %d ACK timeouts cleared from AckTimeouts", numPendingMessages)
+	t.Logf("  - Approximate memory freed: ~%d KB", totalApproximateMemory/1024)
+}

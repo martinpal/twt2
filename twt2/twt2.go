@@ -1037,6 +1037,10 @@ func clearConnectionState() {
 		if conn.Connection != nil {
 			conn.Connection.Close()
 		}
+		// Explicitly clear buffer maps to free memory immediately
+		conn.MessageQueue = nil
+		conn.PendingAcks = nil
+		conn.AckTimeouts = nil
 		delete(currentApp.LocalConnections, connID)
 	}
 	currentApp.LocalConnectionMutex.Unlock()
@@ -1048,6 +1052,10 @@ func clearConnectionState() {
 		if conn.Connection != nil {
 			conn.Connection.Close()
 		}
+		// Explicitly clear buffer maps to free memory immediately
+		conn.MessageQueue = nil
+		conn.PendingAcks = nil
+		conn.AckTimeouts = nil
 		delete(currentApp.RemoteConnections, connID)
 	}
 	currentApp.RemoteConnectionMutex.Unlock()
@@ -2063,6 +2071,12 @@ func closeConnectionRemote(message *twtproto.ProxyComm) {
 	connRecord, ok := app.RemoteConnections[message.Connection]
 	if ok {
 		conn := connRecord.Connection
+
+		// Explicitly clear buffer maps to free memory immediately
+		connRecord.MessageQueue = nil
+		connRecord.PendingAcks = nil
+		connRecord.AckTimeouts = nil
+
 		delete(app.RemoteConnections, message.Connection)
 		time.AfterFunc(1*time.Second, func() {
 			if conn != nil {
@@ -2078,6 +2092,12 @@ func closeConnectionLocal(message *twtproto.ProxyComm) {
 	connRecord, ok := app.LocalConnections[message.Connection]
 	if ok {
 		conn := connRecord.Connection
+
+		// Explicitly clear buffer maps to free memory immediately
+		connRecord.MessageQueue = nil
+		connRecord.PendingAcks = nil
+		connRecord.AckTimeouts = nil
+
 		delete(app.LocalConnections, message.Connection)
 		time.AfterFunc(1*time.Second, func() { conn.Close() })
 	}
