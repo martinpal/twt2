@@ -1,5 +1,5 @@
 module palecci.cz/twtproto
 
-go 1.13
+go 1.23.0
 
-require google.golang.org/protobuf v1.27.1
+require google.golang.org/protobuf v1.35.1

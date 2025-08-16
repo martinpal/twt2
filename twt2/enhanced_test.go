@@ -450,7 +450,7 @@ func TestConnectionHealthMonitor_CongestionDetection(t *testing.T) {
 // Test createPoolConnection with invalid SSH key
 func TestCreatePoolConnection_InvalidSSHKey(t *testing.T) {
 	// This will fail to create connection due to invalid key
-	conn := createPoolConnection(0, "localhost", 22, false, "testuser", "/nonexistent/key", 22)
+	conn := createPoolConnection(0, "127.0.0.1", 1, false, "testuser", "/nonexistent/key", 22)
 
 	if conn != nil {
 		t.Error("Expected nil connection due to invalid SSH key")

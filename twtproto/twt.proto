@@ -8,15 +8,18 @@ message ProxyComm {
   enum MessageType {
     DATA_DOWN        = 0;   // downlink data, presumably most frequent message type
     DATA_UP          = 1;   // uplink data
-    OPEN_CONN        = 2;   // open remote connection to server
-    CLOSE_CONN_S     = 3;   // close remote connection to server
-    CLOSE_CONN_C     = 4;   // close local connection to client
-    PING             = 5;   // ping
+    ACK_DOWN         = 2;   // acknowledge reception of downlink data
+    ACK_UP           = 3;   // acknowledge reception of uplink data
+    OPEN_CONN        = 4;   // open remote connection to server
+    CLOSE_CONN_S     = 5;   // close remote connection to server
+    CLOSE_CONN_C     = 6;   // close local connection to client
+    PING             = 7;   // ping
   }
   MessageType mt     = 1;
-  uint64 proxy       = 2;   // id of the proxy which is sending the message, must by globally unique
+  uint64 proxy       = 2;   // id of the proxy which is sending the message, must be globally unique
   uint64 connection  = 3;   // sequential number of the connection on the local side of the proxy
   uint64 seq         = 4;   // sequential number of the message within the connection, sequential numbers are independent per up/down directions
+                            // sequential numbers in ACK messages reflect sequential numbers of the DATA message they are acknowledging
   string address     = 5;   // remote address to connect to, only used in OPEN_CONN message
   uint32 port        = 6;   // remote port to connect to, only used in OPEN_CONN message
   bytes data         = 7;   // data chunk, only used in DATA_* messages

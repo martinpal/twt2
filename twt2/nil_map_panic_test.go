@@ -34,8 +34,11 @@ import (
 func TestNilMapPanicFix(t *testing.T) {
 	// Initialize app in client mode (which uses RemoteConnections)
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {}
-	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 5, false, true, "", "", 22, false, "", "", "")
+	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 0, false, true, "", "", 22, false, "", "", "")
 	defer func() {
+		if app != nil {
+			app.Stop()
+		}
 		app = nil
 	}()
 
@@ -185,8 +188,11 @@ func TestNilMapPanicFix(t *testing.T) {
 // to ensure the fix works even with multiple goroutines accessing the maps
 func TestNilMapPanicFixConcurrent(t *testing.T) {
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {}
-	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 5, false, true, "", "", 22, false, "", "", "")
+	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 0, false, true, "", "", 22, false, "", "", "")
 	defer func() {
+		if app != nil {
+			app.Stop()
+		}
 		app = nil
 	}()
 
@@ -276,8 +282,11 @@ func TestNilMapPanicFixConcurrent(t *testing.T) {
 // and needs to be created (which was working correctly in the original code)
 func TestNilMapPanicFixNewConnection(t *testing.T) {
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {}
-	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 5, false, true, "", "", 22, false, "", "", "")
+	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 0, false, true, "", "", 22, false, "", "", "")
 	defer func() {
+		if app != nil {
+			app.Stop()
+		}
 		app = nil
 	}()
 

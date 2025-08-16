@@ -68,6 +68,11 @@ func TestIsTLSTraffic(t *testing.T) {
 }
 
 func TestHandleConnection_TLSDetection(t *testing.T) {
+	originalApp := getApp()
+	defer func() {
+		setApp(originalApp)
+	}()
+
 	// Create a mock connection with TLS handshake data
 	mockConn := newMockConn()
 
@@ -87,7 +92,7 @@ func TestHandleConnection_TLSDetection(t *testing.T) {
 	testApp := &App{
 		ListenPort: 33333,
 	}
-	app = testApp
+	setApp(testApp)
 
 	// This should detect TLS and close the connection gracefully
 	// The function should return without causing a panic
