@@ -1825,15 +1825,6 @@ func handleConnectionWithPoolConn(conn net.Conn, poolConn *PoolConnection) {
 
 		length := int(l[1])*256 + int(l[0])
 
-		// Validate message length to detect frame corruption
-		const maxReasonableMessageSize = 64 * 1024 // 64KB max message size
-		if length <= 0 || length > maxReasonableMessageSize {
-			log.Errorf("Invalid message length %d (0x%x), frame sync lost. Length bytes: 0x%02x 0x%02x",
-				length, length, l[0], l[1])
-			log.Warnf("Closing connection due to frame corruption - will trigger reconnection")
-			return
-		}
-
 		log.Tracef("Expecting protobuf message long %d bytes", length)
 		B := make([]byte, 0, length)
 		b := make([]byte, length)
