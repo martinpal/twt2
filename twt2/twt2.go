@@ -1589,6 +1589,12 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 }
 
 func sendProtobuf(message *twtproto.ProxyComm) {
+	// Check if message is nil
+	if message == nil {
+		log.Warnf("Cannot send nil protobuf message")
+		return
+	}
+
 	// Check if app is initialized
 	currentApp := getApp()
 	if currentApp == nil {
