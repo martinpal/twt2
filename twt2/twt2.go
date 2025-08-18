@@ -1970,6 +1970,17 @@ func handleConnectionWithPoolConn(conn net.Conn, poolConn *PoolConnection) {
 	log.Debugf("Registered server client connection %d (total: %d)",
 		serverClientConn.ID, len(serverClientConnections))
 
+	// Send initial ping from server if enabled
+	currentApp := getApp()
+	if currentApp != nil && currentApp.Ping {
+		pingMessage := &twtproto.ProxyComm{
+			Mt:    twtproto.ProxyComm_PING,
+			Proxy: 0, // Server-side ping
+		}
+		sendProtobufToConn(conn, pingMessage)
+		log.Tracef("Server sent initial ping to client connection %d", serverClientConn.ID)
+	}
+
 	defer func() {
 		// Remove this connection from server-side pool when it closes
 		if serverClientConn != nil {
