@@ -261,6 +261,7 @@ func logConnectionPoolStats() {
 type PoolConnection struct {
 	Conn            net.Conn
 	SendChan        chan *twtproto.ProxyComm
+	PriorityChan    chan *twtproto.ProxyComm // High-priority channel for ACK, OPEN_CONN, PING messages
 	ID              uint64
 	InUse           bool
 	LastUsed        time.Time
@@ -460,7 +461,8 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 
 	poolConn := &PoolConnection{
 		Conn:            remoteConn,
-		SendChan:        make(chan *twtproto.ProxyComm, 100),
+		SendChan:        make(chan *twtproto.ProxyComm, 1),
+		PriorityChan:    make(chan *twtproto.ProxyComm, 10), // Larger buffer for priority messages
 		ID:              id,
 		InUse:           false,
 		LastUsed:        time.Now(),
@@ -545,7 +547,8 @@ func createPoolConnectionsParallel(poolInit int, host string, port int, ping boo
 						retryCtx, retryCancel := context.WithCancel(context.Background())
 						placeholderConn := &PoolConnection{
 							Conn:            nil, // No connection initially
-							SendChan:        make(chan *twtproto.ProxyComm, 100),
+							SendChan:        make(chan *twtproto.ProxyComm, 2),
+							PriorityChan:    make(chan *twtproto.ProxyComm, 10),
 							ID:              uint64(connID),
 							InUse:           false,
 							LastUsed:        time.Now(),
@@ -657,23 +660,8 @@ func startConnectionHealthMonitor() {
 
 					// Check for stale connections (no activity for 10 minutes)
 					if time.Since(poolConn.LastHealthCheck) > 10*time.Minute {
-						log.Debugf("Pool connection %d appears stale (last check %v ago), checking channel queue",
+						log.Debugf("Pool connection %d appears stale (last check %v ago)",
 							poolConn.ID, time.Since(poolConn.LastHealthCheck))
-
-						// Check if send channel is getting full
-						queuedMessages := len(poolConn.SendChan)
-						capacity := cap(poolConn.SendChan)
-						if queuedMessages > capacity/2 {
-							log.Warnf("Pool connection %d has %d/%d messages queued - possible congestion",
-								poolConn.ID, queuedMessages, capacity)
-
-							// If queue is nearly full, mark as unhealthy to trigger reconnection
-							if queuedMessages > capacity*3/4 {
-								log.Errorf("Pool connection %d queue nearly full (%d/%d) - marking unhealthy",
-									poolConn.ID, queuedMessages, capacity)
-								poolConn.Healthy = false
-							}
-						}
 					}
 				}
 			}
@@ -821,7 +809,109 @@ func poolConnectionSender(poolConn *PoolConnection) {
 
 	log.Tracef("Starting sender goroutine for pool connection %d", poolConn.ID)
 
-	for message := range poolConn.SendChan {
+	// Handle case where PriorityChan might not be initialized (for tests or old connections)
+	if poolConn.PriorityChan == nil {
+		log.Warnf("PriorityChan not initialized for pool connection %d, falling back to regular channel only", poolConn.ID)
+		// Fallback to original behavior for backward compatibility
+		for message := range poolConn.SendChan {
+			log.Tracef("Processing regular message type %v for pool connection %d", message.Mt, poolConn.ID)
+			// Check if connection is nil (closed/failed)
+			if poolConn.Conn == nil {
+				log.Warnf("Pool connection %d has nil connection, dropping message", poolConn.ID)
+				poolConn.Healthy = false
+				continue
+			}
+
+			// Send with timeout monitoring (same logic as below)
+			done := make(chan bool, 1)
+			var sendError error
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("Panic in sendProtobufToConn for connection %d: %v", poolConn.ID, r)
+						sendError = fmt.Errorf("panic: %v", r)
+					}
+					done <- true
+				}()
+
+				// Set a write deadline before sending
+				if poolConn.Conn != nil {
+					poolConn.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				}
+
+				sendProtobufToConn(poolConn.Conn, message)
+			}()
+
+			select {
+			case <-done:
+				if sendError != nil {
+					log.Errorf("Pool connection %d send error: %v - marking as unhealthy", poolConn.ID, sendError)
+					poolConn.Healthy = false
+					if poolConn.Conn != nil {
+						poolConn.Conn.Close()
+						poolConn.Conn = nil
+					}
+					return // Exit sender to trigger reconnection via receiver
+				}
+				// Message sent successfully - mark as healthy
+				poolConn.Healthy = true
+				poolConn.LastHealthCheck = time.Now()
+
+				// Track statistics for successfully sent message (if stats are initialized)
+				if poolConn.Stats != nil {
+					dataLen := 0
+					if message.GetData() != nil {
+						dataLen = len(message.GetData())
+					}
+					poolConn.Stats.IncrementMessage(message.GetMt(), dataLen)
+				}
+
+			case <-time.After(60 * time.Second):
+				log.Errorf("Pool connection %d write timeout - marking as failed", poolConn.ID)
+				// Mark connection as failed to trigger reconnection
+				poolConn.Healthy = false
+				if poolConn.Conn != nil {
+					poolConn.Conn.Close()
+					poolConn.Conn = nil
+				}
+				return // Exit sender to trigger reconnection via receiver
+			}
+		}
+		log.Tracef("Sender goroutine for pool connection %d ended (regular channel only)", poolConn.ID)
+		return
+	}
+
+	for {
+		var message *twtproto.ProxyComm
+		var msgSource string
+
+		// Priority select: always check priority channel first, then regular
+		select {
+		case message = <-poolConn.PriorityChan:
+			msgSource = "priority"
+		default:
+			// No priority messages, check regular channel
+			select {
+			case message = <-poolConn.PriorityChan:
+				msgSource = "priority"
+			case message = <-poolConn.SendChan:
+				msgSource = "regular"
+			}
+		}
+
+		// If we got a message from the non-blocking select, process it
+		if message != nil {
+			log.Tracef("Processing %s message type %v for pool connection %d", msgSource, message.Mt, poolConn.ID)
+		} else {
+			// Both channels were empty, now block until we get a message
+			select {
+			case message = <-poolConn.PriorityChan:
+				msgSource = "priority"
+			case message = <-poolConn.SendChan:
+				msgSource = "regular"
+			}
+			log.Tracef("Processing %s message type %v for pool connection %d", msgSource, message.Mt, poolConn.ID)
+		}
 		// Check if connection is nil (closed/failed)
 		if poolConn.Conn == nil {
 			log.Warnf("Pool connection %d has nil connection, dropping message", poolConn.ID)
@@ -1588,6 +1678,23 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 	conn.SetWriteDeadline(time.Time{})
 }
 
+// isHighPriorityMessage determines if a message should be sent via the priority channel
+func isHighPriorityMessage(message *twtproto.ProxyComm) bool {
+	if message == nil {
+		return false
+	}
+
+	switch message.Mt {
+	case twtproto.ProxyComm_ACK_DOWN,
+		twtproto.ProxyComm_ACK_UP,
+		twtproto.ProxyComm_OPEN_CONN,
+		twtproto.ProxyComm_PING:
+		return true
+	default:
+		return false
+	}
+}
+
 func sendProtobuf(message *twtproto.ProxyComm) {
 	// Check if message is nil
 	if message == nil {
@@ -1646,7 +1753,7 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 	// Client mode - use pool connections
 	currentApp.PoolMutex.Lock()
-	defer currentApp.PoolMutex.Unlock()
+	// Note: We'll handle mutex unlock explicitly in each return path
 
 	// Find a healthy available pool connection using priority-based selection with LRU
 	var selectedConn *PoolConnection
@@ -1698,32 +1805,101 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 
 	if selectedConn == nil {
 		log.Errorf("No healthy pool connections available (total: %d)", len(currentApp.PoolConnections))
+		currentApp.PoolMutex.Unlock()
 		return
 	}
 
 	log.Tracef("Sending message via pool connection %d", selectedConn.ID)
 	selectedConn.LastUsed = time.Now()
 
-	// Send message through the channel (non-blocking with timeout)
+	// Determine which channel to use based on message priority
+	isHighPriority := isHighPriorityMessage(message)
+	targetChan := selectedConn.SendChan
+	channelType := "regular"
+
+	if isHighPriority && selectedConn.PriorityChan != nil {
+		targetChan = selectedConn.PriorityChan
+		channelType = "priority"
+	}
+
+	// Send message through the appropriate channel (non-blocking with timeout)
 	select {
-	case selectedConn.SendChan <- message:
-		log.Tracef("Message queued for pool connection %d", selectedConn.ID)
+	case targetChan <- message:
+		log.Tracef("Message queued for pool connection %d (%s channel)", selectedConn.ID, channelType)
+		currentApp.PoolMutex.Unlock()
+		return
 	default:
-		log.Warnf("Send channel full for pool connection %d (capacity: %d)", selectedConn.ID, cap(selectedConn.SendChan))
+		log.Tracef("Send channel full for pool connection %d (%s channel, capacity: %d)", selectedConn.ID, channelType, cap(targetChan))
 		// Try to find another connection instead of dropping the message
 		for _, poolConn := range healthyConnections {
 			if poolConn != selectedConn {
+				// Use same priority channel for fallback, with nil check
+				fallbackChan := poolConn.SendChan
+				if isHighPriority && poolConn.PriorityChan != nil {
+					fallbackChan = poolConn.PriorityChan
+				}
+
 				select {
-				case poolConn.SendChan <- message:
+				case fallbackChan <- message:
 					log.Tracef("Message queued for alternative pool connection %d", poolConn.ID)
 					poolConn.LastUsed = time.Now()
+					currentApp.PoolMutex.Unlock()
 					return
 				default:
 					continue // Try next connection
 				}
 			}
 		}
-		log.Errorf("All pool connection channels are full - dropping message type %v for connection %d", message.Mt, message.Connection)
+
+		// All channels are full - wait for space instead of dropping
+		log.Debugf("All pool connection channels are full - waiting for space to send message type %v for connection %d", message.Mt, message.Connection)
+
+		// Release the mutex before entering retry loop to prevent deadlock
+		currentApp.PoolMutex.Unlock()
+
+		// Block and retry periodically until we can send the message
+		ticker := time.NewTicker(10 * time.Millisecond) // Check every 10ms
+		defer ticker.Stop()
+		timeout := time.NewTimer(5 * time.Second) // Timeout after 5 seconds
+		defer timeout.Stop()
+
+		for {
+			select {
+			case <-timeout.C:
+				log.Warnf("Timeout waiting to send message type %v for connection %d - dropping message", message.Mt, message.Connection)
+				return
+			case <-ticker.C:
+				// Re-acquire the mutex for each retry attempt
+				currentApp.PoolMutex.Lock()
+				sent := false
+				for _, poolConn := range currentApp.PoolConnections {
+					if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy {
+						// Use appropriate channel based on priority, with nil check
+						retryChan := poolConn.SendChan
+						if isHighPriority && poolConn.PriorityChan != nil {
+							retryChan = poolConn.PriorityChan
+						}
+
+						select {
+						case retryChan <- message:
+							log.Tracef("Message successfully queued for pool connection %d after waiting (%s channel)", poolConn.ID, channelType)
+							poolConn.LastUsed = time.Now()
+							sent = true
+						default:
+							continue // Channel still full, try next
+						}
+						if sent {
+							break
+						}
+					}
+				}
+				currentApp.PoolMutex.Unlock()
+
+				if sent {
+					return // Successfully sent, exit function
+				}
+			}
+		}
 	}
 }
 
