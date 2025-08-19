@@ -1602,7 +1602,11 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 		b := make([]byte, chunkSize)
 		n, err := bufrw.Read(b)
 		if err != nil {
-			log.Infof("Error reading local connection: %v, going to send CLOSE_CONN_S message to remote end", err)
+			if err == io.EOF {
+				log.Infof("Client closed connection, going to send CLOSE_CONN_S message to remote end")
+			} else {
+				log.Infof("Error reading local connection: %v, going to send CLOSE_CONN_S message to remote end", err)
+			}
 			app.LocalConnectionMutex.Lock()
 			connRecord := app.LocalConnections[thisConnection]
 			connRecord.LastSeqIn++
@@ -2461,7 +2465,7 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 		n, err := conn.Read(b)
 		if err != nil {
 			if err == io.EOF {
-				log.Infof("Error reading remote connection %d: %v", connID, err)
+				log.Infof("Server closed connection %d, going to send CLOSE_CONN_C message to client end", connID)
 				app.RemoteConnectionMutex.Lock()
 				connRecord, ok := app.RemoteConnections[connID]
 				if !ok {
@@ -2489,8 +2493,9 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 
 				sendProtobuf(closeMessage)
 				return
+			} else {
+				log.Infof("Error reading remote connection %d: %v", connID, err)
 			}
-			log.Tracef("Error reading remote connection %d: %v, exiting goroutine", connID, err)
 			currentApp := getApp()
 			if currentApp != nil {
 				currentApp.RemoteConnectionMutex.Lock()
