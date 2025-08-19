@@ -1,45 +1,77 @@
 # TW2 - Trans-Warp Tunnel Proxy
 
-TW2 (Trans-Warp 2) is a high-performance HTTP proxy tunnel system written in Go that allows secure tunneling of HTTP traffic between two endpoints using Protocol Buffers for efficient communication.
+**High-Performance Connection Multiplexing Tunnel with SSH Transport**
 
-TW2 implements HTTP CONNECT method tunneling, which is the standard method for proxying any TCP-based traffic through HTTP proxies. This makes it compatible with HTTPS, SSH, and any other protocol that needs to be tunneled through an HTTP proxy.
+TW2 (Trans-Warp 2) is a sophisticated HTTP proxy tunnel system that **multiplexes and demultiplexes multiple TCP connections through a pool of SSH tunnels**. This connection pooling architecture dramatically improves network utilization by aggregating bandwidth from multiple SSH connections, resulting in **significantly higher throughput and surprisingly lower latency** - even for interactive applications like SSH, RDP, and real-time protocols.
 
-**Security**: TW2 uses SSH tunneling for all connections between client and server, providing strong encryption and SSH key-based authentication. Each tunnel connection uses an independent SSH session to prevent multiplexing vulnerabilities.
+## Key Innovation: Connection Pool Multiplexing
+
+🚀 **Primary Feature**: TW2's core advantage is its ability to **demux/mux TCP connections through a connection pool**, allowing multiple logical connections to share bandwidth across several SSH tunnels simultaneously.
+
+### Performance Benefits
+
+- **Higher Bandwidth Utilization**: Grabs a bigger percentage of available network bandwidth by pooling multiple SSH connections
+- **Reduced Latency**: Even interactive applications (SSH, RDP, VNC) experience lower latency due to intelligent connection distribution
+- **Improved Reliability**: Connection failures are transparent - traffic automatically reroutes through healthy pool connections
+- **Optimal Resource Usage**: Automatically balances load across available SSH tunnels
+
+### How It Works
+
+```
+Multiple Clients         CLIENT SIDE (DEMUX)   SSH POOL   SERVER SIDE (MUX)     Target Services
+                         ┌─────────────────┐ ══════════► ┌─────────────────┐
+Client A (SSH) ────────► │                 │ ══════════► │                 │ ───► SSH Server
+Client B (RDP) ────────► │   TW2 Client    │ ══════════► │   TW2 Server    │ ───► RDP Server
+Client C (HTTP) ───────► │ (Demultiplexer) │ ══════════► │  (Multiplexer)  │ ───► Web Server
+Client D (VNC) ────────► │                 │ ══════════► │                 │ ───► VNC Server
+                         └─────────────────┘ ══════════► └─────────────────┘
+                              Multiple                         Multiple
+                            connections                      connections
+                              demuxed                           muxed
+                                 ▼                                ▼
+                        SSH Tunnel Pool             Individual Target Connections
+```
+
+All data is chunked and distributed across multiple SSH tunnels in the pool, with each logical connection's traffic load-balanced over the available tunnels for maximum bandwidth utilization and seamless failover.
 
 ## Overview
 
-TW2 consists of two main components that work together to create a secure tunnel:
+TW2 consists of two main components that work together to create a secure, multiplexed tunnel:
 
-1. **HTTP Proxy Server** - Accepts HTTP requests and forwards them through the tunnel
-2. **Protocol Buffer Server** - Handles the actual tunneling communication between endpoints
+1. **HTTP Proxy Server** - Accepts HTTP CONNECT requests and multiplexes them through the SSH tunnel pool
+2. **Protocol Buffer Server** - Handles demultiplexing and reliable delivery at the remote endpoint
 
-The system uses connection pooling, sequence numbering, and message queuing to ensure reliable and efficient data transmission.
+The system uses connection pooling, sequence numbering, and message queuing to ensure reliable and efficient data transmission across multiple SSH channels.
 
 ## Architecture
 
 ```
-Client → HTTP Proxy → SSH Tunnel → Remote SSH → ProtoBuf Server → Target Server
+Clients → HTTP Proxy → SSH Pool (Mux) → Remote SSH → ProtoBuf Server (Demux) → Target Servers
 ```
 
 ### Key Features
 
-- **SSH Tunneling**: All tunnel connections use independent SSH sessions for strong encryption and authentication
-- **SSH Key Authentication**: Uses SSH public key authentication (no passwords)
-- **HTTP CONNECT Method**: Implements standard HTTP CONNECT tunneling for universal protocol support
-- **Connection Pooling**: Maintains a pool of persistent SSH tunnel connections for efficient data transfer
-- **Sequence Numbering**: Ensures ordered delivery of data packets
-- **Message Queuing**: Handles out-of-order messages and connection reliability
-- **Concurrent Processing**: Uses goroutines for handling multiple connections simultaneously
-- **Configurable Logging**: Multiple log levels for debugging and monitoring
-- **Connection Management**: Automatic cleanup and resource management
-- **Independent SSH Sessions**: Each pool connection uses its own SSH process (no ControlMaster)
+- **🎯 Connection Pool Multiplexing**: Multiple TCP connections share bandwidth across several SSH tunnels for maximum throughput
+- **📈 Bandwidth Optimization**: Achieves higher network utilization than single-connection tunnels
+- **⚡ Low Latency**: Intelligent load distribution reduces latency even for interactive protocols
+- **🔒 SSH Tunneling**: All tunnel connections use independent SSH sessions for strong encryption and authentication
+- **🔑 SSH Key Authentication**: Uses SSH public key authentication (no passwords)
+- **🌐 HTTP CONNECT Method**: Implements standard HTTP CONNECT tunneling for universal protocol support
+- **🔄 Automatic Failover**: Seamless connection rerouting when individual SSH tunnels fail
+- **📊 Sequence Numbering**: Ensures ordered delivery of data packets across the connection pool
+- **📨 Message Queuing**: Handles out-of-order messages and connection reliability
+- **⚙️ Concurrent Processing**: Uses goroutines for handling multiple connections simultaneously
+- **📝 Configurable Logging**: Multiple log levels for debugging and monitoring
+- **🧹 Connection Management**: Automatic cleanup and resource management
 
 ### Protocol Messages
 
 The system uses Protocol Buffers with the following message types:
-- `DATA_DOWN`: Downlink data transmission
-- `DATA_UP`: Uplink data transmission  
-- `OPEN_CONN`: Open new remote connection
+- `DATA_DOWN`: Downlink data transmission (server to client)
+- `DATA_UP`: Uplink data transmission (client to server)
+- `ACK_DOWN`: Acknowledge reception of downlink data
+- `ACK_UP`: Acknowledge reception of uplink data
+- `OPEN_CONN`: Open new remote connection to target server
 - `CLOSE_CONN_S`: Close remote server connection
 - `CLOSE_CONN_C`: Close local client connection
 - `PING`: Keep-alive messages
@@ -65,17 +97,18 @@ The system uses Protocol Buffers with the following message types:
 
 ## Dependencies
 
-- **Go 1.13+** - Programming language
+- **Go 1.23+** - Programming language
 - **Protocol Buffers** - Message serialization
-- **github.com/golang/protobuf** - Go protobuf support
-- **github.com/silenceper/pool** - Connection pooling
+- **google.golang.org/protobuf** - Modern Go protobuf support
 - **github.com/sirupsen/logrus** - Structured logging
+- **golang.org/x/crypto** - SSH client implementation
+- **github.com/stretchr/testify** - Testing framework (development only)
 
 ## Building
 
 ### Prerequisites
 
-1. Install Go 1.13 or later
+1. Install Go 1.23 or later
 2. Install Protocol Buffer compiler (protoc) if modifying `.proto` files
 3. **SSH Setup (Required)**:
    - SSH server running on the target host
@@ -85,67 +118,66 @@ The system uses Protocol Buffers with the following message types:
 
 ### Build Instructions
 
-#### Quick Build (with version info)
+#### Build
 
 ```bash
 # Clone the repository
 git clone <repository-url>
 cd twt2
 
-# Build using the provided build script (includes git commit hash)
-./build.sh
+# Build both dynamic and static binaries (recommended)
+make all
+
+# Or build specific variants:
+make build     # Dynamic binary with version info
+make static    # Static binary (no CGO dependencies)
+make dev       # Development build with race detector
 ```
 
-#### Build Options
-
-The build script supports various options for different use cases:
+#### Make Targets Available
 
 ```bash
-# Static binary with version info
-./build.sh --static
+# Build targets
+make build         # Build dynamic binary
+make static        # Build static binary
+make dev           # Development build with race detector
+make all           # Build both dynamic and static (default)
 
-# Custom output name
-./build.sh --output tw2-server
+# Testing and quality
+make test          # Run all tests
+make test-coverage # Run tests with coverage report
+make bench         # Run benchmarks
+make lint          # Run go vet
+make fmt           # Format code
 
-# Verbose build with additional info
-./build.sh --verbose
-
-# Show all build options
-./build.sh --help
+# Maintenance
+make clean         # Remove build artifacts
+make deps          # Install dependencies
+make tidy          # Tidy go modules
+make version       # Show version of built binaries
+make help          # Show all available targets
 ```
 
-#### Manual Build (basic)
+### Testing and Development
 
 ```bash
-# Build without version info (not recommended)
-cd main
-go build -o tw2
-```
+# Run all tests
+make test
 
-#### Build with Custom Version Info
+# Run tests with coverage report
+make test-coverage
 
-```bash
-# Manual build with version embedding
-cd main
-COMMIT_HASH=$(git rev-parse --short HEAD)
-BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-go build -ldflags "-X 'main.commitHash=${COMMIT_HASH}' -X 'main.buildTime=${BUILD_TIME}'" -o tw2
-```
+# Run benchmarks
+make bench
 
-### Building All Modules
+# Development build with race detector
+make dev
 
-```bash
-# Build twt2 library
-cd twt2
-go build
+# Format and lint code
+make fmt lint
 
-# Build twtproto library  
-cd ../twtproto
-go build
-
-# Build main executable
-cd ../main
-go build -o tw2
+# Clean build artifacts
+make clean
 ```
 
 ## SSH Setup
@@ -156,7 +188,7 @@ go build -o tw2
    ```bash
    # Ubuntu/Debian
    sudo apt-get install openssh-server
-   
+
    # CentOS/RHEL
    sudo yum install openssh-server
    ```
