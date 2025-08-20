@@ -315,8 +315,7 @@ func BenchmarkConnectionCreationParallel(b *testing.B) {
 				LastSeqIn:    0,
 				NextSeqOut:   0,
 				MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-				PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-				AckTimeouts:  make(map[uint64]time.Time),
+				PendingAcks:  make(map[uint64]*PendingAck),
 			}
 
 			app.LocalConnectionMutex.Lock()

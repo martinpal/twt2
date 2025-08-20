@@ -29,6 +29,43 @@ type mockConn struct {
 	mu         sync.RWMutex
 }
 
+// testCleanup stops all background goroutines to prevent race conditions
+func testCleanup() {
+	// Stop all pool connections first
+	StopAllPoolConnections()
+
+	// Stop the current app if it exists
+	currentApp := getApp()
+	if currentApp != nil {
+		currentApp.Stop()
+	}
+
+	// Wait longer for background goroutines to exit
+	time.Sleep(200 * time.Millisecond)
+
+	// Clear any remaining goroutines by setting app to nil temporarily
+	setApp(nil)
+	time.Sleep(50 * time.Millisecond)
+}
+
+// testCleanupWithApp stops background goroutines and restores a clean app
+func testCleanupWithApp() *App {
+	testCleanup()
+
+	// Create a fresh, clean app
+	cleanApp := &App{
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+		PoolConnections:       make([]*PoolConnection, 0),
+		PoolMutex:             sync.Mutex{},
+	}
+	cleanApp.ctx, cleanApp.cancel = context.WithCancel(context.Background())
+	setApp(cleanApp)
+	return cleanApp
+}
+
 func newMockConn() *mockConn {
 	return &mockConn{
 		readData:  make([]byte, 0),
@@ -290,19 +327,17 @@ func TestNewApp_ServerMode(t *testing.T) {
 
 // Test GetApp function
 func TestGetApp(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Test when app is nil
-	app = nil
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
+
 	if GetApp() != nil {
 		t.Error("GetApp should return nil when app is nil")
 	}
 
 	// Test when app is set
 	testApp := &App{ListenPort: 12345}
-	setApp(testApp)
+	SafeSetTestApp(testApp)
 	if GetApp() != testApp {
 		t.Error("GetApp should return the set app instance")
 	}
@@ -313,12 +348,10 @@ func TestGetApp(t *testing.T) {
 
 // Test clearConnectionState function
 func TestClearConnectionState(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Test when app is nil
-	app = nil
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
+
 	clearConnectionState() // Should not panic
 
 	// Setup test app with connections
@@ -326,7 +359,7 @@ func TestClearConnectionState(t *testing.T) {
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
 	}
-	setApp(testApp)
+	SafeSetTestApp(testApp)
 
 	// Add some test connections
 	app.LocalConnections[1] = Connection{Connection: nil, LastSeqIn: 0, NextSeqOut: 1}
@@ -347,16 +380,13 @@ func TestClearConnectionState(t *testing.T) {
 
 // Test handleProxycommMessage with PING message
 func TestHandleProxycommMessage_Ping(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Setup test app
 	testApp := &App{
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create PING message
 	pingMessage := &twtproto.ProxyComm{
@@ -373,12 +403,9 @@ func TestHandleProxycommMessage_Ping(t *testing.T) {
 
 // Test handleProxycommMessage with nil app
 func TestHandleProxycommMessage_NilApp(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Set app to nil
-	app = nil
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
 
 	// Create test message
 	testMessage := &twtproto.ProxyComm{
@@ -424,19 +451,14 @@ func TestSendProtobufToConn(t *testing.T) {
 
 // Test sendProtobuf function with server mode
 func TestSendProtobuf_ServerMode(t *testing.T) {
-	// Reset global variables
-	originalApp := getApp()
 	originalProtobufConnection := protobufConnection
 	defer func() {
-		setApp(originalApp)
 		protobufConnection = originalProtobufConnection
 		// Clean up server client connections to avoid interference
 		serverClientMutex.Lock()
 		serverClientConnections = []*ServerClientConnection{}
 		nextServerClientID = 0
 		serverClientMutex.Unlock()
-		StopAllPoolConnections()
-		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
 	}()
 
 	// Clean up server client connections first
@@ -447,9 +469,16 @@ func TestSendProtobuf_ServerMode(t *testing.T) {
 
 	// Setup server mode app (no pool connections)
 	testApp := &App{
-		PoolConnections: make([]*PoolConnection, 0),
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+		PoolConnections:       make([]*PoolConnection, 0),
+		PoolMutex:             sync.Mutex{},
 	}
-	setApp(testApp)
+	testApp.ctx, testApp.cancel = context.WithCancel(context.Background())
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Setup mock protobuf connection
 	mockConn := newMockConn()
@@ -479,10 +508,6 @@ func TestSendProtobuf_ServerMode(t *testing.T) {
 
 // Test sendProtobuf function with client mode
 func TestSendProtobuf_ClientMode(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Setup client mode app with pool connection
 	mockConn := newMockConn()
 	poolConn := &PoolConnection{
@@ -496,10 +521,8 @@ func TestSendProtobuf_ClientMode(t *testing.T) {
 	testApp := &App{
 		PoolConnections: []*PoolConnection{poolConn},
 	}
-	setApp(testApp)
-
-	// Start sender goroutine
-	go poolConnectionSender(poolConn)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create test message
 	testMessage := &twtproto.ProxyComm{
@@ -510,42 +533,32 @@ func TestSendProtobuf_ClientMode(t *testing.T) {
 		Data:       []byte("test data"),
 	}
 
-	// Execute
+	// Execute sendProtobuf (which should send to poolConn.SendChan)
 	sendProtobuf(testMessage)
 
-	// Give some time for the message to be processed
-	time.Sleep(10 * time.Millisecond)
-
-	// Assert message was sent via pool connection
-	writtenMessages := mockConn.getWrittenMessages()
-	if len(writtenMessages) != 1 {
-		t.Fatalf("Expected 1 message written, got %d", len(writtenMessages))
-	}
-
-	if writtenMessages[0].Mt != twtproto.ProxyComm_DATA_UP {
-		t.Errorf("Expected DATA_UP message, got %v", writtenMessages[0].Mt)
-	}
-	if string(writtenMessages[0].Data) != "test data" {
-		t.Errorf("Expected 'test data', got %s", string(writtenMessages[0].Data))
+	// Check that message was queued in the channel
+	select {
+	case receivedMessage := <-poolConn.SendChan:
+		if receivedMessage.Mt != twtproto.ProxyComm_DATA_UP {
+			t.Errorf("Expected DATA_UP message, got %v", receivedMessage.Mt)
+		}
+		if string(receivedMessage.Data) != "test data" {
+			t.Errorf("Expected 'test data', got %s", string(receivedMessage.Data))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected message to be sent to pool connection channel")
 	}
 }
 
 // Test handleConnection function with valid message
 func TestHandleConnection_ValidMessage(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() {
-		app = originalApp
-		StopAllPoolConnections()
-		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
-	}()
-
 	// Setup test app
 	testApp := &App{
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create mock connection with PING message
 	mockConn := newMockConn()
@@ -611,17 +624,14 @@ func TestHandleConnection_InvalidFrameLength(t *testing.T) {
 
 // Test handleProxycommMessage with OPEN_CONN
 func TestHandleProxycommMessage_OpenConn(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Setup test app
 	testApp := &App{
 		LocalConnections:      make(map[uint64]Connection),
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create OPEN_CONN message
 	openMessage := &twtproto.ProxyComm{
@@ -642,16 +652,13 @@ func TestHandleProxycommMessage_OpenConn(t *testing.T) {
 
 // Test backwardDataChunk and forwardDataChunk functions
 func TestDataChunkForwarding(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Setup test app
 	testApp := &App{
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Test backward data chunk (server to client)
 	mockLocalConn := newMockConn()
@@ -700,23 +707,30 @@ func TestDataChunkForwarding(t *testing.T) {
 
 // Test connection closing functions
 func TestConnectionClosing(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
-	// Setup test app
+	// Setup test app with proper initialization
 	testApp := &App{
-		LocalConnections:  make(map[uint64]Connection),
-		RemoteConnections: make(map[uint64]Connection),
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+		PoolConnections:       make([]*PoolConnection, 0),
+		PoolMutex:             sync.Mutex{},
 	}
-	setApp(testApp)
+	testApp.ctx, testApp.cancel = context.WithCancel(context.Background())
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
-	// Add test connections
+	// Add test connections using proper locking
 	mockLocalConn := newMockConn()
 	mockRemoteConn := newMockConn()
 
-	app.LocalConnections[1] = Connection{Connection: mockLocalConn}
-	app.RemoteConnections[2] = Connection{Connection: mockRemoteConn}
+	testApp.LocalConnectionMutex.Lock()
+	testApp.LocalConnections[1] = Connection{Connection: mockLocalConn}
+	testApp.LocalConnectionMutex.Unlock()
+
+	testApp.RemoteConnectionMutex.Lock()
+	testApp.RemoteConnections[2] = Connection{Connection: mockRemoteConn}
+	testApp.RemoteConnectionMutex.Unlock()
 
 	// Test closing local connection
 	closeLocalMessage := &twtproto.ProxyComm{
@@ -726,7 +740,10 @@ func TestConnectionClosing(t *testing.T) {
 	closeConnectionLocal(closeLocalMessage)
 
 	// Assert local connection was removed
-	if _, exists := app.LocalConnections[1]; exists {
+	testApp.LocalConnectionMutex.Lock()
+	_, exists := testApp.LocalConnections[1]
+	testApp.LocalConnectionMutex.Unlock()
+	if exists {
 		t.Error("Expected local connection 1 to be removed")
 	}
 
@@ -738,7 +755,10 @@ func TestConnectionClosing(t *testing.T) {
 	closeConnectionRemote(closeRemoteMessage)
 
 	// Assert remote connection was removed
-	if _, exists := app.RemoteConnections[2]; exists {
+	testApp.RemoteConnectionMutex.Lock()
+	_, exists = testApp.RemoteConnections[2]
+	testApp.RemoteConnectionMutex.Unlock()
+	if exists {
 		t.Error("Expected remote connection 2 to be removed")
 	}
 }
@@ -886,11 +906,8 @@ func TestCreatePoolConnection_MockSSH(t *testing.T) {
 
 // Test Hijack function
 func TestHijack(t *testing.T) {
-	// Reset global app variable
-	originalApp := getApp()
 	originalProtobufConnection := protobufConnection
 	defer func() {
-		app = originalApp
 		protobufConnection = originalProtobufConnection
 	}()
 
@@ -900,7 +917,8 @@ func TestHijack(t *testing.T) {
 		LastLocalConnection:  1,
 		LocalConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Setup mock protobuf connection to avoid "No protobuf connection available" error
 	mockProtobufConn := newMockConn()
@@ -961,16 +979,14 @@ func TestHijack(t *testing.T) {
 
 // Test Hijack function with non-hijackable response writer
 func TestHijack_NonHijackable(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Set up minimal app for the test
 	testApp := &App{
 		LocalConnections:     make(map[uint64]Connection),
 		LastLocalConnection:  1,
 		LocalConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create test request and regular response writer (not hijackable)
 	req, _ := http.NewRequest("CONNECT", "example.com:443", nil)
@@ -1015,15 +1031,13 @@ func TestProtobufServer(t *testing.T) {
 
 // Test handleRemoteSideConnection function
 func TestHandleRemoteSideConnection(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	testApp := &App{
 		LocalConnections:      make(map[uint64]Connection),
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create mock connection and add it to local connections
 	mockConn := newMockConn()
@@ -1072,18 +1086,11 @@ func TestHandleRemoteSideConnection(t *testing.T) {
 
 // Test poolConnectionReceiver function
 func TestPoolConnectionReceiver(t *testing.T) {
-	originalApp := getApp()
-	defer func() {
-		setApp(originalApp) // Use safe app setting
-		StopAllPoolConnections()
-		// Give goroutines time to fully terminate
-		time.Sleep(500 * time.Millisecond)
-	}()
-
 	testApp := &App{
 		LocalConnections: make(map[uint64]Connection),
 	}
-	setApp(testApp) // Use safe app setting
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create a mock connection
 	mockConn := newMockConn()
@@ -1149,16 +1156,14 @@ func TestPoolConnectionReceiver(t *testing.T) {
 
 // Test with error conditions to improve coverage
 func TestHandleProxycommMessage_ErrorCases(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	testApp := &App{
 		LocalConnections:      make(map[uint64]Connection),
 		RemoteConnections:     make(map[uint64]Connection),
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Test with non-existent connection ID for DATA_DOWN message
 	testMessage := &twtproto.ProxyComm{
@@ -1204,6 +1209,15 @@ func TestHandleProxycommMessage_ErrorCases(t *testing.T) {
 
 // Test sendProtobuf error cases
 func TestSendProtobuf_ErrorCases(t *testing.T) {
+	// Create isolated test app
+	testApp := &App{
+		LocalConnections:  make(map[uint64]Connection),
+		RemoteConnections: make(map[uint64]Connection),
+		PoolConnections:   make([]*PoolConnection, 0), // No pool connections to avoid background goroutines
+	}
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
+
 	originalProtobufConnection := protobufConnection
 	defer func() { protobufConnection = originalProtobufConnection }()
 
@@ -1230,16 +1244,14 @@ func TestSendProtobuf_ErrorCases(t *testing.T) {
 
 // Test more handleProxycommMessage cases to increase coverage
 func TestHandleProxycommMessage_MoreCases(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	testApp := &App{
 		LocalConnections:      make(map[uint64]Connection),
 		RemoteConnections:     make(map[uint64]Connection),
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Test CLOSE_CONN_S message
 	closeServerMessage := &twtproto.ProxyComm{
@@ -1262,14 +1274,12 @@ func TestHandleProxycommMessage_MoreCases(t *testing.T) {
 
 // Test newConnection function
 func TestNewConnection(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	testApp := &App{
 		RemoteConnections:     make(map[uint64]Connection),
 		RemoteConnectionMutex: sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Test with valid address and port
 	message := &twtproto.ProxyComm{
@@ -1404,15 +1414,13 @@ func TestSendProtobufToConn_ErrorCases(t *testing.T) {
 
 // Test clearConnectionState with more scenarios
 func TestClearConnectionState_Extended(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	// Test with connections that have actual network connections
 	testApp := &App{
 		LocalConnections:  make(map[uint64]Connection),
 		RemoteConnections: make(map[uint64]Connection),
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Add connections with mock network connections
 	mockConn1 := newMockConn()
@@ -1457,22 +1465,19 @@ func TestClearConnectionState_Extended(t *testing.T) {
 
 // Test Hijack with more error conditions
 func TestHijack_MoreErrorConditions(t *testing.T) {
-	originalApp := getApp()
+	// Save original protobuf connection
 	originalProtobufConnection := protobufConnection
 	defer func() {
-		app = originalApp
 		protobufConnection = originalProtobufConnection
 	}()
 
 	// Test with nil protobuf connection
 	protobufConnection = nil
 
-	testApp := &App{
-		LocalConnections:     make(map[uint64]Connection),
-		LastLocalConnection:  1,
-		LocalConnectionMutex: sync.Mutex{},
-	}
-	setApp(testApp)
+	testApp := testCleanupWithApp()
+	testApp.LastLocalConnection = 1
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	req, _ := http.NewRequest("CONNECT", "example.com:443", nil)
 	req.Host = "example.com:443"
@@ -1489,14 +1494,13 @@ func TestHijack_MoreErrorConditions(t *testing.T) {
 
 // Test handleConnection with various frame corruption scenarios
 func TestHandleConnection_FrameCorruption(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	testApp := &App{
-		LocalConnections:  make(map[uint64]Connection),
-		RemoteConnections: make(map[uint64]Connection),
+		LocalConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex: sync.Mutex{},
+		RemoteConnections:    make(map[uint64]Connection),
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Test with incomplete length header (only 1 byte)
 	mockConn1 := newMockConn()
@@ -1550,6 +1554,9 @@ func TestHandleConnection_FrameCorruption(t *testing.T) {
 
 // Test NewApp with different configurations to increase coverage
 func TestNewApp_ExtendedConfigurations(t *testing.T) {
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
+
 	var apps []*App
 	defer func() {
 		// Stop all created apps
@@ -1558,7 +1565,6 @@ func TestNewApp_ExtendedConfigurations(t *testing.T) {
 				app.Stop()
 			}
 		}
-		StopAllPoolConnections()
 		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
 	}()
 
@@ -1602,14 +1608,16 @@ func TestCreatePoolConnection_ErrorConditions(t *testing.T) {
 
 // Test message queue processing
 func TestMessageQueueProcessing(t *testing.T) {
-	originalApp := getApp()
-	defer func() { setApp(originalApp) }()
-
 	testApp := &App{
-		LocalConnections:     make(map[uint64]Connection),
-		LocalConnectionMutex: sync.Mutex{},
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
+		LocalConnectionMutex:  sync.Mutex{},
+		RemoteConnectionMutex: sync.Mutex{},
+		PoolConnections:       make([]*PoolConnection, 0),
+		PoolMutex:             sync.Mutex{},
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Create a connection with message queue
 	mockConn := newMockConn()
@@ -1617,9 +1625,7 @@ func TestMessageQueueProcessing(t *testing.T) {
 		Connection:   mockConn,
 		NextSeqOut:   3, // Expecting sequence 3
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-	}
-
-	// Add some out-of-order messages to the queue
+	} // Add some out-of-order messages to the queue
 	conn.MessageQueue[4] = &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_DATA_DOWN,
 		Connection: 1,
@@ -1684,25 +1690,16 @@ func TestProtobufServer_ExtendedScenarios(t *testing.T) {
 
 // Test connection cleanup scenarios
 func TestConnectionCleanup(t *testing.T) {
-	originalApp := getApp()
-	defer func() {
-		if getApp() != nil && getApp() != originalApp {
-			getApp().Stop()
-		}
-		setApp(originalApp) // Use safe app setting
-		StopAllPoolConnections()
-		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
-	}()
-
 	testApp := &App{
 		LocalConnections:      make(map[uint64]Connection),
 		RemoteConnections:     make(map[uint64]Connection),
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
+		PoolConnections:       make([]*PoolConnection, 0),
+		PoolMutex:             sync.Mutex{},
 	}
-	// Create context for the test app to avoid nil pointer issues
-	testApp.ctx, testApp.cancel = context.WithCancel(context.Background())
-	setApp(testApp) // Use safe app setting
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Add connections with message queues
 	mockLocalConn := newMockConn()
@@ -1787,19 +1784,23 @@ func TestCreatePoolConnectionsParallel(t *testing.T) {
 
 // Test NewApp with parallel pool creation
 func TestNewApp_ParallelPoolCreation(t *testing.T) {
-	// Store original app and restore after test
-	originalApp := getApp()
-	defer func() {
-		setApp(originalApp)
-		StopAllPoolConnections()
-		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
-	}()
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
 
 	handler := http.NotFoundHandler().ServeHTTP
 
 	// Test with no pool connections to avoid background SSH retry goroutines
 	newApp := NewApp(handler, 8080, "example.com", 22, 0, 5, false, true, "user", "nonexistent", 22, false, "", "", "")
-	setApp(newApp)
+
+	// Clean up the new app when test finishes
+	defer func() {
+		if newApp != nil {
+			newApp.Stop()
+		}
+	}()
+
+	// Use SafeSetTestApp instead of direct setApp to ensure proper cleanup
+	SafeSetTestApp(newApp)
 
 	// Since we're using pool size 0, no connections should be created
 	currentApp := getApp()
@@ -1926,9 +1927,6 @@ func TestSendProxyAuthRequired(t *testing.T) {
 
 // Test servePACFile function
 func TestServePACFile(t *testing.T) {
-	// Save original app state
-	originalApp := getApp()
-
 	tests := []struct {
 		name           string
 		pacFilePath    string
@@ -1952,9 +1950,11 @@ func TestServePACFile(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Set up test app
-			setApp(&App{
+			testApp := &App{
 				PACFilePath: tt.pacFilePath,
-			})
+			}
+			originalApp := SafeSetTestApp(testApp)
+			defer SafeRestoreApp(originalApp)
 
 			w := &mockResponseWriter{}
 			req, _ := http.NewRequest("GET", "/proxy.pac", nil)
@@ -1985,9 +1985,11 @@ func TestServePACFile(t *testing.T) {
 
 	// Test with existing PAC file
 	t.Run("Valid PAC file", func(t *testing.T) {
-		setApp(&App{
+		testApp := &App{
 			PACFilePath: "../proxy.pac", // Use the existing PAC file with relative path
-		})
+		}
+		originalApp := SafeSetTestApp(testApp)
+		defer SafeRestoreApp(originalApp)
 
 		w := &mockResponseWriter{}
 		req, _ := http.NewRequest("GET", "/proxy.pac", nil)
@@ -2016,33 +2018,19 @@ func TestServePACFile(t *testing.T) {
 			t.Errorf("Expected response to contain 'FindProxyForURL'")
 		}
 	})
-
-	// Restore original app state
-	app = originalApp
 }
 
 // Test App.ServeHTTP method for proxy authentication integration
 func TestApp_ServeHTTP_ProxyAuth(t *testing.T) {
-	// Save original app state
-	originalApp := getApp()
-
-	defer func() {
-		// Restore original app state and stop any pool connections
-		if app != nil {
-			app.Stop()
-		}
-		app = originalApp
-		StopAllPoolConnections()
-		time.Sleep(100 * time.Millisecond) // Give goroutines time to stop
-	}()
-
 	// Test with proxy authentication enabled and a proper handler
 	mockHandler := func(w http.ResponseWriter, r *http.Request) {
 		// Call the Hijack function which contains the actual proxy logic
 		Hijack(w, r)
 	}
 
-	app = NewApp(mockHandler, 8080, "localhost", 9090, 0, 0, false, false, "", "", 22, true, "testuser", "testpass", "../proxy.pac")
+	testApp := NewApp(mockHandler, 8080, "localhost", 9090, 0, 0, false, false, "", "", 22, true, "testuser", "testpass", "../proxy.pac")
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	tests := []struct {
 		name           string
@@ -2103,6 +2091,9 @@ func TestApp_ServeHTTP_ProxyAuth(t *testing.T) {
 
 // Test poolConnectionSender function
 func TestPoolConnectionSender_Coverage(t *testing.T) {
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
+
 	// Create a mock pool connection
 	poolConn := &PoolConnection{
 		ID:       1,
@@ -2125,8 +2116,8 @@ func TestPoolConnectionSender_Coverage(t *testing.T) {
 	poolConn.SendChan <- testMessage
 	close(poolConn.SendChan)
 
-	// Give it a moment to process
-	time.Sleep(10 * time.Millisecond)
+	// Give it a moment to process and exit
+	time.Sleep(50 * time.Millisecond)
 
 	// Test passes if no panic occurs
 }
@@ -2207,17 +2198,12 @@ func TestIsTLSTraffic_EdgeCases(t *testing.T) {
 
 // Test handleHTTPRequest function
 func TestHandleHTTPRequest(t *testing.T) {
-	// Save original app state
-	originalApp := getApp()
-	defer func() {
-		setApp(originalApp)
-		// Stop any background goroutines
-		StopAllPoolConnections()
-	}()
-
-	setApp(&App{
+	// Set up test app
+	testApp := &App{
 		PACFilePath: "",
-	})
+	}
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	tests := []struct {
 		name           string
@@ -2342,14 +2328,6 @@ func TestStartSSHKeepAlive(t *testing.T) {
 
 // Test Hijack function with proxy authentication
 func TestHijack_ProxyAuthentication(t *testing.T) {
-	// Save original app state
-	originalApp := getApp()
-	defer func() {
-		setApp(originalApp)
-		// Stop any background goroutines
-		StopAllPoolConnections()
-	}()
-
 	// Set up minimal app with proxy authentication enabled (avoid starting background goroutines)
 	testApp := &App{
 		LocalConnections:      make(map[uint64]Connection),
@@ -2366,7 +2344,8 @@ func TestHijack_ProxyAuthentication(t *testing.T) {
 		ProxyUsername:         "testuser",
 		ProxyPassword:         "testpass",
 	}
-	setApp(testApp)
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	tests := []struct {
 		name           string
@@ -2431,7 +2410,4 @@ func TestHijack_ProxyAuthentication(t *testing.T) {
 			}
 		})
 	}
-
-	// Restore original app state
-	setApp(originalApp)
 }

@@ -11,13 +11,9 @@ import (
 
 // TestSSHConnectionFailureScenarios tests comprehensive SSH connection failure scenarios
 func TestSSHConnectionFailureScenarios(t *testing.T) {
-	// Save original app state
-	originalApp := app
-	defer func() {
-		app = originalApp
-		StopAllPoolConnections()
-		time.Sleep(100 * time.Millisecond) // Give cleanup time
-	}()
+	// Use safe app pattern to avoid race conditions
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
 
 	t.Run("SSH key file not found", func(t *testing.T) {
 		poolConn := createPoolConnection(1, "127.0.0.1", 22, false, "testuser", "/nonexistent/path/to/key", 22)

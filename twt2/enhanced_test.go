@@ -375,9 +375,6 @@ func TestSendProtobuf_AppNotInitialized(t *testing.T) {
 
 // Test startConnectionHealthMonitor functionality
 func TestStartConnectionHealthMonitor(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
-
 	// Create app with connections in various states
 	unhealthyConn := &PoolConnection{
 		ID:              0,
@@ -397,10 +394,13 @@ func TestStartConnectionHealthMonitor(t *testing.T) {
 		LastHealthCheck: time.Now(),
 	}
 
-	app = &App{
+	testApp := &App{
 		PoolConnections: []*PoolConnection{unhealthyConn, healthyConn},
 		PoolMutex:       sync.Mutex{},
 	}
+
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Start health monitor
 	startConnectionHealthMonitor()
@@ -414,9 +414,6 @@ func TestStartConnectionHealthMonitor(t *testing.T) {
 
 // Test connection health monitoring with congested channels
 func TestConnectionHealthMonitor_CongestionDetection(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
-
 	// Create connection with nearly full channel
 	congestedConn := &PoolConnection{
 		ID:              0,
@@ -432,10 +429,13 @@ func TestConnectionHealthMonitor_CongestionDetection(t *testing.T) {
 		congestedConn.SendChan <- &twtproto.ProxyComm{Mt: twtproto.ProxyComm_PING}
 	}
 
-	app = &App{
+	testApp := &App{
 		PoolConnections: []*PoolConnection{congestedConn},
 		PoolMutex:       sync.Mutex{},
 	}
+
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Start health monitor
 	startConnectionHealthMonitor()
@@ -459,11 +459,10 @@ func TestCreatePoolConnection_InvalidSSHKey(t *testing.T) {
 
 // Test StopAllPoolConnections
 func TestStopAllPoolConnections(t *testing.T) {
-	originalApp := app
-	defer func() { app = originalApp }()
+	// Test with nil app first
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
 
-	// Test with nil app
-	app = nil
 	StopAllPoolConnections() // Should not panic
 
 	// Test with app having connections
@@ -475,10 +474,12 @@ func TestStopAllPoolConnections(t *testing.T) {
 		retryCtx:    ctx,
 	}
 
-	app = &App{
+	testApp := &App{
 		PoolConnections: []*PoolConnection{poolConn},
 		PoolMutex:       sync.Mutex{},
 	}
+
+	SafeSetTestApp(testApp)
 
 	StopAllPoolConnections()
 

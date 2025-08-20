@@ -12,8 +12,14 @@ func TestMain(m *testing.M) {
 	// Set log level to PANIC to suppress all log noise in tests (ERROR, WARN, INFO, DEBUG)
 	logrus.SetLevel(logrus.PanicLevel)
 
+	// Initial cleanup to ensure clean test environment
+	CleanTestEnvironment()
+
 	// Run tests
 	result := m.Run()
+
+	// Final cleanup
+	CleanTestEnvironment()
 
 	// Restore log level
 	logrus.SetLevel(logrus.InfoLevel)

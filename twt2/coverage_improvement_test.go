@@ -1,7 +1,6 @@
 package twt2
 
 import (
-	"context"
 	"sync"
 	"testing"
 	"time"
@@ -57,15 +56,11 @@ func TestLogConnectionPoolStats(t *testing.T) {
 
 // TestStartConnectionHealthMonitor tests the health monitoring system
 func TestStartConnectionHealthMonitorCoverage(t *testing.T) {
-	// Save original app
-	originalApp := app
-	defer func() { app = originalApp }()
-
-	// Create test app with pool connections
+	// Use safe test app pattern
 	mockConn1 := newMockConn()
 	mockConn2 := newMockConn()
 
-	app = &App{
+	testApp := &App{
 		PoolConnections: []*PoolConnection{
 			{
 				ID:              1,
@@ -84,6 +79,9 @@ func TestStartConnectionHealthMonitorCoverage(t *testing.T) {
 		},
 		PoolMutex: sync.Mutex{},
 	}
+
+	originalApp := SafeSetTestApp(testApp)
+	defer SafeRestoreApp(originalApp)
 
 	// Start health monitor
 	startConnectionHealthMonitor()
@@ -105,87 +103,43 @@ func TestStartConnectionHealthMonitorCoverage(t *testing.T) {
 	t.Logf("✓ Pool connections maintained during health monitoring")
 }
 
-// TestStartAckTimeoutChecker tests the ACK timeout monitoring system
-func TestStartAckTimeoutChecker(t *testing.T) {
-	// Create mock connections
-	mockLocalConn := &MockConnection{}
-	mockRemoteConn := &MockConnection{}
+// TestBasicRetransmissionStructures tests connection-failure-based retransmission structures
+func TestBasicRetransmissionStructures(t *testing.T) {
+	// Create test app
+	originalApp := getApp()
+	defer setApp(originalApp)
 
-	// Create test app with proper context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	app := &App{
-		ctx: ctx,
-		LocalConnections: map[uint64]Connection{
-			1: {
-				Connection:  mockLocalConn,
-				PendingAcks: make(map[uint64]*twtproto.ProxyComm),
-				AckTimeouts: make(map[uint64]time.Time),
-			},
-		},
-		RemoteConnections: map[uint64]Connection{
-			2: {
-				Connection:  mockRemoteConn,
-				PendingAcks: make(map[uint64]*twtproto.ProxyComm),
-				AckTimeouts: make(map[uint64]time.Time),
-			},
-		},
+	testApp := &App{
+		LocalConnections:      make(map[uint64]Connection),
+		RemoteConnections:     make(map[uint64]Connection),
 		LocalConnectionMutex:  sync.Mutex{},
 		RemoteConnectionMutex: sync.Mutex{},
 	}
+	setApp(testApp)
 
-	// Set the global app instance for getApp() to work
-	setApp(app)
-	defer setApp(nil) // Clean up
-
-	// Add some pending ACKs with timeouts
-	dataUpMsg := &twtproto.ProxyComm{
+	// Test basic retransmission setup
+	testMessage := &twtproto.ProxyComm{
 		Mt:         twtproto.ProxyComm_DATA_UP,
 		Connection: 1,
 		Seq:        1,
 		Data:       []byte("test data"),
 	}
 
-	dataDownMsg := &twtproto.ProxyComm{
-		Mt:         twtproto.ProxyComm_DATA_DOWN,
-		Connection: 2,
-		Seq:        1,
-		Data:       []byte("test data"),
+	pendingAck := &PendingAck{
+		Message:          testMessage,
+		PoolConnectionID: 1,
 	}
 
-	// Add timed-out messages to trigger retransmission logic
-	app.LocalConnectionMutex.Lock()
-	localConn := app.LocalConnections[1]
-	localConn.PendingAcks[1] = dataUpMsg
-	localConn.AckTimeouts[1] = time.Now().Add(-1 * time.Second) // Expired
-	app.LocalConnections[1] = localConn
-	app.LocalConnectionMutex.Unlock()
+	// Test that PendingAck structure works correctly
+	if pendingAck.Message.Mt != twtproto.ProxyComm_DATA_UP {
+		t.Errorf("Expected DATA_UP message type, got %v", pendingAck.Message.Mt)
+	}
 
-	app.RemoteConnectionMutex.Lock()
-	remoteConn := app.RemoteConnections[2]
-	remoteConn.PendingAcks[1] = dataDownMsg
-	remoteConn.AckTimeouts[1] = time.Now().Add(-1 * time.Second) // Expired
-	app.RemoteConnections[2] = remoteConn
-	app.RemoteConnectionMutex.Unlock()
+	if pendingAck.PoolConnectionID != 1 {
+		t.Errorf("Expected pool connection ID 1, got %d", pendingAck.PoolConnectionID)
+	}
 
-	t.Logf("Set up pending ACKs with expired timeouts")
-
-	// Start ACK timeout checker
-	startAckTimeoutChecker(app)
-
-	// Wait for timeout checker to run a short time
-	time.Sleep(100 * time.Millisecond)
-
-	// Cancel context to stop the checker
-	cancel()
-
-	// Wait a bit more for cleanup
-	time.Sleep(100 * time.Millisecond)
-
-	t.Logf("✓ ACK timeout checker started and stopped successfully")
-
-	// The test mainly verifies that the function doesn't crash
+	t.Logf("✓ Connection-failure retransmission structures working correctly")
 }
 
 // TestCreatePoolConnectionErrors tests error handling in pool connection creation
@@ -278,20 +232,19 @@ func TestSSHKeepAliveEdgeCases(t *testing.T) {
 
 // TestStopAllPoolConnections tests stopping all pool connections
 func TestStopAllPoolConnectionsCoverage(t *testing.T) {
-	// Save original app
-	originalApp := app
-	defer func() { app = originalApp }()
+	// Test with no app - use safe pattern
+	originalApp := SafeSetTestApp(nil)
+	defer SafeRestoreApp(originalApp)
 
-	// Test with no app
-	app = nil
 	StopAllPoolConnections() // Should not panic
 	t.Logf("✓ StopAllPoolConnections handles nil app gracefully")
 
 	// Test with app but no pool connections
-	app = &App{
+	testApp := &App{
 		PoolConnections: []*PoolConnection{},
 		PoolMutex:       sync.Mutex{},
 	}
+	SafeSetTestApp(testApp)
 	StopAllPoolConnections() // Should not panic
 	t.Logf("✓ StopAllPoolConnections handles empty pool gracefully")
 

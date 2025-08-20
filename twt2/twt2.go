@@ -37,6 +37,7 @@ var connectionRetryConfig = struct {
 	MaxRetries:   -1, // -1 means unlimited retries
 }
 var connectionRetryMutex sync.RWMutex
+var clearConnectionStateMutex sync.Mutex
 
 var app *App
 var appMutex sync.RWMutex
@@ -52,6 +53,276 @@ func setApp(newApp *App) {
 	appMutex.Lock()
 	defer appMutex.Unlock()
 	app = newApp
+}
+
+// initUndeliveredMessageSystem initializes the channel-based undelivered message system
+func initUndeliveredMessageSystem() {
+	undeliveredMessageSystemOnce.Do(func() {
+		undeliveredMessageChan = make(chan *UndeliveredMessage, undeliveredMessageBufferSize)
+		undeliveredPriorityMessageChan = make(chan *UndeliveredMessage, undeliveredPriorityBufferSize)
+	})
+}
+
+// startUndeliveredMessageProcessor starts a single goroutine to process undelivered messages
+func startUndeliveredMessageProcessor() {
+	undeliveredMessageProcessor.mutex.Lock()
+	defer undeliveredMessageProcessor.mutex.Unlock()
+
+	if undeliveredMessageProcessor.running {
+		return // Already running
+	}
+
+	// Create fresh channels each time we start
+	undeliveredMessageProcessor.stop = make(chan struct{})
+	undeliveredMessageProcessor.done = make(chan struct{})
+	undeliveredMessageProcessor.running = true
+
+	go func() {
+		defer func() {
+			undeliveredMessageProcessor.mutex.Lock()
+			undeliveredMessageProcessor.running = false
+			undeliveredMessageProcessor.mutex.Unlock()
+			close(undeliveredMessageProcessor.done)
+		}()
+
+		log.Debug("Undelivered message processor started")
+
+		for {
+			select {
+			case <-undeliveredMessageProcessor.stop:
+				log.Debug("Undelivered message processor stopping")
+				return
+
+			case priorityMsg := <-undeliveredPriorityMessageChan:
+				// Process priority messages first
+				processUndeliveredMessage(priorityMsg, true)
+				// Small delay to prevent excessive CPU usage when processing many messages
+				time.Sleep(10 * time.Millisecond)
+
+			case normalMsg := <-undeliveredMessageChan:
+				// Process normal messages, but check for priority messages first
+				select {
+				case priorityMsg := <-undeliveredPriorityMessageChan:
+					// Priority message arrived, process it first and put normal message back
+					processUndeliveredMessage(priorityMsg, true)
+					// Try to put normal message back (non-blocking)
+					select {
+					case undeliveredMessageChan <- normalMsg:
+					default:
+						log.Warnf("Undelivered message channel full, dropping normal message for connection %d", normalMsg.ConnectionID)
+					}
+				default:
+					// No priority messages, process normal message
+					processUndeliveredMessage(normalMsg, false)
+				}
+				// Small delay to prevent excessive CPU usage when processing many messages
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+}
+
+// processUndeliveredMessage attempts to send a single undelivered message
+func processUndeliveredMessage(msg *UndeliveredMessage, isPriority bool) {
+	if msg == nil {
+		return
+	}
+
+	currentApp := getApp()
+	if currentApp == nil {
+		return
+	}
+
+	maxRetries := 3
+	retryDelay := time.Minute * 2 // Wait 2 minutes between retries
+
+	// Check if message is too old or has too many retries
+	if msg.RetryCount >= maxRetries {
+		log.Warnf("Dropping %s undelivered message for connection %d after %d retries",
+			getPriorityString(isPriority), msg.ConnectionID, msg.RetryCount)
+		return
+	}
+
+	// Check if message is too new for retry (except first attempt)
+	if msg.RetryCount > 0 && time.Since(msg.Timestamp) < retryDelay {
+		// Put message back in appropriate channel for later processing
+		// Don't update timestamp - keep original timestamp for proper retry delay
+		select {
+		case undeliveredPriorityMessageChan <- msg:
+			if isPriority {
+				log.Tracef("Requeued priority message for connection %d (retry %d, waiting %v)",
+					msg.ConnectionID, msg.RetryCount, retryDelay-time.Since(msg.Timestamp))
+			}
+		case undeliveredMessageChan <- msg:
+			if !isPriority {
+				log.Tracef("Requeued normal message for connection %d (retry %d, waiting %v)",
+					msg.ConnectionID, msg.RetryCount, retryDelay-time.Since(msg.Timestamp))
+			}
+		default:
+			log.Warnf("Failed to requeue %s message for connection %d - channels full", getPriorityString(isPriority), msg.ConnectionID)
+		}
+		return
+	}
+
+	// Try to send through available connections
+	sent := false
+
+	// For client side, try pool connections
+	if len(currentApp.PoolConnections) > 0 {
+		currentApp.PoolMutex.Lock()
+		for _, poolConn := range currentApp.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy {
+				// Send directly to avoid recursive sendProtobuf calls
+				sendProtobufToConn(poolConn.Conn, msg.Message)
+				sent = true
+				log.Tracef("Resent %s undelivered message for connection %d (retry %d)",
+					getPriorityString(isPriority), msg.ConnectionID, msg.RetryCount+1)
+				break
+			}
+		}
+		currentApp.PoolMutex.Unlock()
+	} else {
+		// For server side, try active client connections first, then fallback
+		serverClientMutex.RLock()
+		activeConnections := make([]*ServerClientConnection, 0)
+		for _, clientConn := range serverClientConnections {
+			if clientConn.Active && clientConn.Conn != nil {
+				activeConnections = append(activeConnections, clientConn)
+			}
+		}
+		serverClientMutex.RUnlock()
+
+		if len(activeConnections) > 0 {
+			// Use the first active client connection
+			selectedConn := activeConnections[0]
+			sendProtobufToConn(selectedConn.Conn, msg.Message)
+			sent = true
+			log.Tracef("Resent %s undelivered message for connection %d via server client connection (retry %d)",
+				getPriorityString(isPriority), msg.ConnectionID, msg.RetryCount+1)
+		} else {
+			// Fallback to protobuf connection only if it exists and no client connections
+			protobufConnectionMutex.RLock()
+			conn := protobufConnection
+			protobufConnectionMutex.RUnlock()
+
+			if conn != nil {
+				sendProtobufToConn(conn, msg.Message)
+				sent = true
+				log.Tracef("Resent %s undelivered message for connection %d via fallback protobuf connection (retry %d)",
+					getPriorityString(isPriority), msg.ConnectionID, msg.RetryCount+1)
+			}
+		}
+	}
+
+	if !sent {
+		// Increment retry count and requeue
+		msg.RetryCount++
+		msg.Timestamp = time.Now()
+
+		// Put back in appropriate channel
+		if isPriority {
+			select {
+			case undeliveredPriorityMessageChan <- msg:
+				log.Tracef("Requeued priority message for connection %d (retry %d)", msg.ConnectionID, msg.RetryCount)
+			default:
+				log.Warnf("Priority undelivered message channel full, dropping message for connection %d", msg.ConnectionID)
+			}
+		} else {
+			select {
+			case undeliveredMessageChan <- msg:
+				log.Tracef("Requeued normal message for connection %d (retry %d)", msg.ConnectionID, msg.RetryCount)
+			default:
+				log.Warnf("Normal undelivered message channel full, dropping message for connection %d", msg.ConnectionID)
+			}
+		}
+	}
+}
+
+// getPriorityString returns a string representation of priority status
+func getPriorityString(isPriority bool) string {
+	if isPriority {
+		return "priority"
+	}
+	return "normal"
+}
+
+// queueUndeliveredMessage adds a message to the appropriate undelivered message channel
+func queueUndeliveredMessage(message *twtproto.ProxyComm, connectionID uint64, isLocal bool) {
+	if message == nil {
+		return
+	}
+
+	undeliveredMsg := &UndeliveredMessage{
+		Message:      message,
+		ConnectionID: connectionID,
+		IsLocal:      isLocal,
+		Timestamp:    time.Now(),
+		RetryCount:   0,
+	}
+
+	// Determine if this is a priority message
+	isPriority := isHighPriorityMessage(message)
+
+	if isPriority {
+		select {
+		case undeliveredPriorityMessageChan <- undeliveredMsg:
+			log.Tracef("Queued priority undelivered message for connection %d", connectionID)
+		default:
+			log.Warnf("Priority undelivered message channel full, dropping message for connection %d", connectionID)
+		}
+	} else {
+		select {
+		case undeliveredMessageChan <- undeliveredMsg:
+			log.Tracef("Queued normal undelivered message for connection %d", connectionID)
+		default:
+			log.Warnf("Normal undelivered message channel full, dropping message for connection %d", connectionID)
+		}
+	}
+}
+
+// getUndeliveredMessageStats returns statistics about the undelivered message channels
+func getUndeliveredMessageStats() (int, int, int) {
+	normalTotal := len(undeliveredMessageChan)
+	priorityTotal := len(undeliveredPriorityMessageChan)
+	total := normalTotal + priorityTotal
+
+	// We can't easily distinguish local vs remote from channel contents without draining,
+	// so we'll return total, normal, priority instead
+	return total, normalTotal, priorityTotal
+}
+
+// stopUndeliveredMessageProcessor stops the undelivered message processor
+func stopUndeliveredMessageProcessor() {
+	undeliveredMessageProcessor.mutex.Lock()
+
+	if !undeliveredMessageProcessor.running {
+		undeliveredMessageProcessor.mutex.Unlock()
+		return
+	}
+
+	// Signal the processor to stop
+	close(undeliveredMessageProcessor.stop)
+	undeliveredMessageProcessor.mutex.Unlock()
+
+	// Wait for processor to finish
+	<-undeliveredMessageProcessor.done
+}
+
+// stopStatsLogger stops the stats logger
+func stopStatsLogger() {
+	statsLogger.mutex.Lock()
+
+	if !statsLogger.running {
+		statsLogger.mutex.Unlock()
+		return
+	}
+
+	// Signal the logger to stop
+	close(statsLogger.stop)
+	statsLogger.mutex.Unlock()
+
+	// Wait for logger to finish
+	<-statsLogger.done
 }
 
 // SetConnectionRetryConfig configures connection retry parameters
@@ -133,11 +404,43 @@ func (s *PoolConnectionStats) GetStats() (map[twtproto.ProxyComm_MessageType]uin
 
 // startStatsLogger starts a goroutine that logs connection pool statistics every 5 minutes
 func startStatsLogger() {
-	ticker := time.NewTicker(1 * time.Minute)
+	statsLogger.mutex.Lock()
+	defer statsLogger.mutex.Unlock()
+
+	if statsLogger.running {
+		return
+	}
+
+	statsLogger.stop = make(chan struct{})
+	statsLogger.done = make(chan struct{})
+	statsLogger.ticker = time.NewTicker(1 * time.Minute)
+	statsLogger.running = true
+
 	go func() {
-		defer ticker.Stop()
-		for range ticker.C {
-			logConnectionPoolStats()
+		defer func() {
+			statsLogger.mutex.Lock()
+			statsLogger.running = false
+			if statsLogger.ticker != nil {
+				statsLogger.ticker.Stop()
+			}
+			statsLogger.mutex.Unlock()
+			close(statsLogger.done)
+		}()
+
+		log.Debug("Stats logger started")
+
+		for {
+			select {
+			case <-statsLogger.stop:
+				log.Debug("Stats logger stopping")
+				return
+
+			case <-statsLogger.ticker.C:
+				// Check if app still exists before logging stats
+				if getApp() != nil {
+					logConnectionPoolStats()
+				}
+			}
 		}
 	}()
 }
@@ -154,10 +457,20 @@ func logConnectionPoolStats() {
 	isClientSide := len(currentApp.PoolConnections) > 0
 	currentApp.PoolMutex.Unlock()
 
+	// Double-check app still exists after acquiring mutex
+	if getApp() == nil {
+		return
+	}
+
 	if isClientSide {
 		// Client side - log pool connection statistics
 		currentApp.PoolMutex.Lock()
 		defer currentApp.PoolMutex.Unlock()
+
+		// Final check if app still exists after acquiring the mutex
+		if getApp() == nil {
+			return
+		}
 
 		log.Debugf("=== Client Pool Connection Statistics ===")
 		log.Debugf("Total pool connections: %d", len(currentApp.PoolConnections))
@@ -277,15 +590,20 @@ type PoolConnection struct {
 	Stats           *PoolConnectionStats // Statistics for this connection
 }
 
+// PendingAck represents a message waiting for acknowledgment
+type PendingAck struct {
+	Message          *twtproto.ProxyComm // the message waiting for ACK
+	PoolConnectionID uint64              // ID of pool connection used to send this message (0 for server-side)
+}
+
 type Connection struct {
 	Connection   net.Conn
 	LastSeqIn    uint64                         // last sequence number we have used for the last incoming chunk
 	NextSeqOut   uint64                         // next sequence number to be sent out
 	MessageQueue map[uint64]*twtproto.ProxyComm // queue of messages with too high sequence numbers
 	// ACK tracking fields for reliable message delivery
-	PendingAcks map[uint64]*twtproto.ProxyComm // messages waiting for ACK, keyed by sequence number
-	AckTimeouts map[uint64]time.Time           // timeout timestamps for pending ACKs
-	LastAckSent uint64                         // last sequence number we acknowledged
+	PendingAcks map[uint64]*PendingAck // messages waiting for ACK, keyed by sequence number
+	LastAckSent uint64                 // last sequence number we acknowledged
 }
 
 type App struct {
@@ -350,6 +668,10 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 	// Create context for managing background goroutines
 	appInstance.ctx, appInstance.cancel = context.WithCancel(context.Background())
 
+	// Initialize undelivered message system for both client and server
+	initUndeliveredMessageSystem()
+	log.Debug("Initialized undelivered message system")
+
 	// Only create pool connections on client side
 	if isClient && peerHost != "" {
 		log.Debug("Creating bidirectional connection pool (client side)")
@@ -362,19 +684,12 @@ func NewApp(f Handler, listenPort int, peerHost string, peerPort int, poolInit i
 		// Start connection health monitoring
 		startConnectionHealthMonitor()
 		log.Debug("Started connection health monitoring")
-
-		// Start ACK timeout checking
-		startAckTimeoutChecker(appInstance)
-		log.Debug("Started ACK timeout monitoring")
-	} else {
-		log.Debug("Server side - no pool connections created")
-
-		// Start ACK timeout checking on server side too
-		startAckTimeoutChecker(appInstance)
-		log.Debug("Started ACK timeout monitoring (server side)")
 	}
 
-	// Start statistics logging on both client and server side
+	// Start common services for both client and server side
+	startUndeliveredMessageProcessor()
+	log.Debug("Started undelivered message processing")
+
 	startStatsLogger()
 	log.Debug("Started connection pool statistics logging (every minute)")
 
@@ -388,9 +703,15 @@ func (a *App) Stop() {
 	if a.cancel != nil {
 		a.cancel()
 	}
+	stopUndeliveredMessageProcessor()
+	stopStatsLogger()
 }
 
 func createPoolConnection(id uint64, host string, port int, ping bool, sshUser string, sshKeyPath string, sshPort int) *PoolConnection {
+	return createPoolConnectionWithOptions(id, host, port, ping, sshUser, sshKeyPath, sshPort, true)
+}
+
+func createPoolConnectionWithOptions(id uint64, host string, port int, ping bool, sshUser string, sshKeyPath string, sshPort int, startGoroutines bool) *PoolConnection {
 	log.Tracef("Creating SSH tunnel connection %d to %s@%s:%d (SSH port %d)", id, sshUser, host, port, sshPort)
 
 	// Read SSH private key
@@ -474,18 +795,20 @@ func createPoolConnection(id uint64, host string, port int, ping bool, sshUser s
 		Stats:           NewPoolConnectionStats(),
 	}
 
-	// Start goroutines for this connection
-	go poolConnectionSender(poolConn)
-	go poolConnectionReceiver(poolConn)
-	startSSHKeepAlive(poolConn) // Start SSH keep-alive for this connection
+	// Start goroutines for this connection (only if requested)
+	if startGoroutines {
+		go poolConnectionSender(poolConn)
+		go poolConnectionReceiver(poolConn)
+		startSSHKeepAlive(poolConn) // Start SSH keep-alive for this connection
 
-	// Send initial ping if enabled
-	if ping {
-		pingMessage := &twtproto.ProxyComm{
-			Mt:    twtproto.ProxyComm_PING,
-			Proxy: proxyID,
+		// Send initial ping if enabled
+		if ping {
+			pingMessage := &twtproto.ProxyComm{
+				Mt:    twtproto.ProxyComm_PING,
+				Proxy: proxyID,
+			}
+			poolConn.SendChan <- pingMessage
 		}
-		poolConn.SendChan <- pingMessage
 	}
 
 	log.Infof("SSH tunnel connection %d established: direct tunnel -> %s@%s:%d (protobuf port %d)", id, sshUser, host, sshPort, port)
@@ -605,11 +928,20 @@ func StopAllPoolConnections() {
 	currentApp.PoolMutex.Lock()
 	defer currentApp.PoolMutex.Unlock()
 
+	// Cancel all retry contexts to signal goroutines to stop
 	for _, poolConn := range currentApp.PoolConnections {
 		if poolConn.retryCancel != nil {
 			poolConn.retryCancel()
 		}
+		// Also close the connection to break out of any blocking reads
+		if poolConn.Conn != nil {
+			poolConn.Conn.Close()
+		}
 	}
+
+	// Wait a short time for goroutines to notice cancellation and exit
+	// This is a practical timeout since we can't easily wait for all goroutines
+	time.Sleep(200 * time.Millisecond)
 }
 
 // startSSHKeepAlive starts the SSH keep-alive goroutine with proper lifecycle management
@@ -636,38 +968,53 @@ func startConnectionHealthMonitor() {
 		ticker := time.NewTicker(2 * time.Minute) // Check every 2 minutes
 		defer ticker.Stop()
 
-		for range ticker.C {
-			currentApp := getApp()
-			if currentApp == nil {
-				continue
-			}
+		checkTicker := time.NewTicker(100 * time.Millisecond) // Quick check for nil app
+		defer checkTicker.Stop()
 
-			currentApp.PoolMutex.Lock()
-			if len(currentApp.PoolConnections) == 0 {
-				currentApp.PoolMutex.Unlock()
-				continue
-			}
-			healthyCount := 0
-			totalCount := len(currentApp.PoolConnections)
+		for {
+			select {
+			case <-ticker.C:
+				// Main health check - only execute if app exists
+				currentApp := getApp()
+				if currentApp == nil {
+					log.Tracef("Connection health monitor exiting due to nil app")
+					return
+				}
 
-			for _, poolConn := range currentApp.PoolConnections {
-				if poolConn == nil {
+				currentApp.PoolMutex.Lock()
+				if len(currentApp.PoolConnections) == 0 {
+					currentApp.PoolMutex.Unlock()
 					continue
 				}
+				healthyCount := 0
+				totalCount := len(currentApp.PoolConnections)
 
-				if poolConn.Healthy && poolConn.Conn != nil {
-					healthyCount++
+				for _, poolConn := range currentApp.PoolConnections {
+					if poolConn == nil {
+						continue
+					}
 
-					// Check for stale connections (no activity for 10 minutes)
-					if time.Since(poolConn.LastHealthCheck) > 10*time.Minute {
-						log.Debugf("Pool connection %d appears stale (last check %v ago)",
-							poolConn.ID, time.Since(poolConn.LastHealthCheck))
+					if poolConn.Healthy && poolConn.Conn != nil {
+						healthyCount++
+
+						// Check for stale connections (no activity for 10 minutes)
+						if time.Since(poolConn.LastHealthCheck) > 10*time.Minute {
+							log.Debugf("Pool connection %d appears stale (last check %v ago)",
+								poolConn.ID, time.Since(poolConn.LastHealthCheck))
+						}
 					}
 				}
-			}
 
-			log.Debugf("Connection health: %d/%d healthy connections", healthyCount, totalCount)
-			currentApp.PoolMutex.Unlock()
+				log.Debugf("Connection health: %d/%d healthy connections", healthyCount, totalCount)
+				currentApp.PoolMutex.Unlock()
+
+			case <-checkTicker.C:
+				// Quick check for nil app to exit during test cleanup
+				if getApp() == nil {
+					log.Tracef("Connection health monitor exiting due to nil app")
+					return
+				}
+			}
 		}
 	}()
 }
@@ -724,81 +1071,6 @@ func sshKeepAlive(ctx context.Context, poolConn *PoolConnection) {
 			}
 		}
 	}
-}
-
-// startAckTimeoutChecker monitors pending ACKs and retransmits timed-out messages
-func startAckTimeoutChecker(appInstance *App) {
-	go func() {
-		ticker := time.NewTicker(1 * time.Second) // Check every second
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-appInstance.ctx.Done():
-				return // Stop when context is cancelled
-			case <-ticker.C:
-				// Get app safely
-				currentApp := getApp()
-				if currentApp == nil {
-					continue
-				}
-
-				now := time.Now()
-
-				// Check local connections for timed-out DATA_UP messages
-				currentApp.LocalConnectionMutex.Lock()
-				for connID, connection := range currentApp.LocalConnections {
-					// Initialize maps if they don't exist (for backward compatibility)
-					if connection.PendingAcks == nil {
-						connection.PendingAcks = make(map[uint64]*twtproto.ProxyComm)
-					}
-					if connection.AckTimeouts == nil {
-						connection.AckTimeouts = make(map[uint64]time.Time)
-					}
-
-					for seq, timeout := range connection.AckTimeouts {
-						if now.After(timeout) {
-							// Timeout occurred, retransmit the message
-							if pendingMsg, exists := connection.PendingAcks[seq]; exists {
-								log.Warnf("ACK timeout for DATA_UP connection %d, seq %d - retransmitting", connID, seq)
-								// Update timeout for next attempt
-								connection.AckTimeouts[seq] = now.Add(5 * time.Second)
-								// Retransmit the message
-								sendProtobuf(pendingMsg)
-							}
-						}
-					}
-				}
-				currentApp.LocalConnectionMutex.Unlock()
-
-				// Check remote connections for timed-out DATA_DOWN messages
-				currentApp.RemoteConnectionMutex.Lock()
-				for connID, connection := range currentApp.RemoteConnections {
-					// Initialize maps if they don't exist (for backward compatibility)
-					if connection.PendingAcks == nil {
-						connection.PendingAcks = make(map[uint64]*twtproto.ProxyComm)
-					}
-					if connection.AckTimeouts == nil {
-						connection.AckTimeouts = make(map[uint64]time.Time)
-					}
-
-					for seq, timeout := range connection.AckTimeouts {
-						if now.After(timeout) {
-							// Timeout occurred, retransmit the message
-							if pendingMsg, exists := connection.PendingAcks[seq]; exists {
-								log.Warnf("ACK timeout for DATA_DOWN connection %d, seq %d - retransmitting", connID, seq)
-								// Update timeout for next attempt
-								connection.AckTimeouts[seq] = now.Add(5 * time.Second)
-								// Retransmit the message
-								sendProtobuf(pendingMsg)
-							}
-						}
-					}
-				}
-				currentApp.RemoteConnectionMutex.Unlock()
-			}
-		}
-	}()
 }
 
 func poolConnectionSender(poolConn *PoolConnection) {
@@ -882,6 +1154,14 @@ func poolConnectionSender(poolConn *PoolConnection) {
 	}
 
 	for {
+		// Check if app still exists (for test cleanup) - only during testing
+		testApp := getApp()
+		if testApp == nil && poolConn.retryCtx != nil {
+			// If app is nil and we have a test context, exit gracefully
+			log.Tracef("Pool connection %d sender goroutine exiting due to nil app during test", poolConn.ID)
+			return
+		}
+
 		var message *twtproto.ProxyComm
 		var msgSource string
 
@@ -988,6 +1268,14 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 	reconnectDelay, maxReconnectDelay, maxRetries := getConnectionRetryConfig()
 
 	for {
+		// Check if app still exists (for test cleanup) - only during testing
+		testApp := getApp()
+		if testApp == nil && poolConn.retryCtx != nil {
+			// If app is nil and we have a test context, exit gracefully
+			log.Tracef("Pool connection %d receiver goroutine exiting due to nil app during test", poolConn.ID)
+			return
+		}
+
 		// Check if context was canceled (for tests)
 		if poolConn.retryCtx != nil {
 			select {
@@ -1010,10 +1298,8 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 			log.Infof("Pool connection %d starting initial connection attempt", poolConn.ID)
 		}
 
-		// Clear any connection state that might be corrupted (only if we had a connection)
-		if poolConn.Conn != nil {
-			clearConnectionState()
-		}
+		// Handle individual pool connection failure with proper isolation
+		handlePoolConnectionFailure(poolConn)
 
 		// Cancel the keep-alive for the old connection
 		poolConn.keepAliveMutex.Lock()
@@ -1052,7 +1338,7 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 		// Attempt to recreate the connection
 		currentApp := getApp()
 		if currentApp != nil {
-			newPoolConn := createPoolConnection(poolConn.ID, currentApp.PeerHost, currentApp.PeerPort, currentApp.Ping, currentApp.SSHUser, currentApp.SSHKeyPath, currentApp.SSHPort)
+			newPoolConn := createPoolConnectionWithOptions(poolConn.ID, currentApp.PeerHost, currentApp.PeerPort, currentApp.Ping, currentApp.SSHUser, currentApp.SSHKeyPath, currentApp.SSHPort, false)
 			if newPoolConn != nil {
 				// Update the pool connection with new connection details
 				currentApp.PoolMutex.Lock()
@@ -1074,7 +1360,7 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 				retryCount = 0                                                             // Reset retry count on success
 				reconnectDelay, maxReconnectDelay, maxRetries = getConnectionRetryConfig() // Get fresh config
 
-				// Send ping if enabled
+				// Send ping if enabled (since we didn't start goroutines, no initial ping was sent)
 				currentPingApp := getApp() // Use safe app access
 				if currentPingApp != nil && currentPingApp.Ping {
 					pingMessage := &twtproto.ProxyComm{
@@ -1111,41 +1397,265 @@ func poolConnectionReceiver(poolConn *PoolConnection) {
 	}
 }
 
+// handlePoolConnectionFailure handles the failure of a single pool connection
+// while preserving all logical connections (they will be rerouted to healthy pools)
+func handlePoolConnectionFailure(failedPoolConn *PoolConnection) {
+	currentApp := getApp()
+	if currentApp == nil {
+		return
+	}
+
+	log.Warnf("Handling failure of pool connection %d - preserving logical connections", failedPoolConn.ID)
+
+	// Close only the failed pool connection
+	if failedPoolConn.Conn != nil {
+		failedPoolConn.Conn.Close()
+		failedPoolConn.Conn = nil
+	}
+
+	// Mark as unhealthy
+	failedPoolConn.Healthy = false
+
+	// Check if we have any healthy pool connections remaining
+	healthyPoolCount := 0
+	for _, poolConn := range currentApp.PoolConnections {
+		if poolConn.Healthy && poolConn != failedPoolConn {
+			healthyPoolCount++
+		}
+	}
+
+	if healthyPoolCount > 0 {
+		log.Infof("Pool connection %d failed, but %d healthy pool connections remain - logical connections preserved",
+			failedPoolConn.ID, healthyPoolCount)
+
+		// Retransmit all pending messages from the failed pool connection through healthy connections
+		retransmitPendingMessagesFromFailedPool(failedPoolConn.ID)
+	} else {
+		log.Warnf("Pool connection %d failed and no healthy pool connections remain - clearing all connection state",
+			failedPoolConn.ID)
+		// Only clear all connection state if ALL pool connections are unhealthy
+		clearConnectionState()
+	}
+}
+
+// clearPendingAcksForFailedConnection clears pending ACKs to prevent
+// retransmission attempts to a failed connection
+func clearPendingAcksForFailedConnection(failedConnectionID uint64) {
+	currentApp := getApp()
+	if currentApp == nil {
+		return
+	}
+
+	log.Debugf("Clearing pending ACKs for failed connection %d", failedConnectionID)
+
+	currentApp.RemoteConnectionMutex.Lock()
+	defer currentApp.RemoteConnectionMutex.Unlock()
+
+	// Clear pending ACKs for all remote connections
+	// This prevents ACK retransmissions from trying to use the failed connection
+	clearedCount := 0
+	for _, connection := range currentApp.RemoteConnections {
+		if connection.PendingAcks != nil {
+			clearedPending := len(connection.PendingAcks)
+			if clearedPending > 0 {
+				connection.PendingAcks = make(map[uint64]*PendingAck)
+				clearedCount += clearedPending
+			}
+		}
+	}
+
+	if clearedCount > 0 {
+		log.Infof("Cleared %d pending ACKs to prevent retransmission to failed connection %d",
+			clearedCount, failedConnectionID)
+	}
+}
+
+// retransmitPendingMessagesFromFailedPool retransmits all pending messages that were sent through a failed pool connection
+func retransmitPendingMessagesFromFailedPool(failedPoolConnectionID uint64) {
+	currentApp := getApp()
+	if currentApp == nil {
+		return
+	}
+
+	log.Debugf("Retransmitting pending messages from failed pool connection %d", failedPoolConnectionID)
+
+	retransmittedCount := 0
+
+	// Retransmit local connection messages (DATA_UP)
+	currentApp.LocalConnectionMutex.Lock()
+	for connID, connection := range currentApp.LocalConnections {
+		if connection.PendingAcks == nil {
+			continue
+		}
+
+		for seq, pendingAck := range connection.PendingAcks {
+			// Only retransmit messages that were sent through the failed pool connection
+			if pendingAck.PoolConnectionID == failedPoolConnectionID {
+				log.Debugf("Retransmitting DATA_UP message conn=%d seq=%d from failed pool connection %d",
+					connID, seq, failedPoolConnectionID)
+
+				// Send through a different pool connection and update the tracking
+				newPoolConnID := sendProtobufWithTracking(pendingAck.Message)
+				pendingAck.PoolConnectionID = newPoolConnID
+				retransmittedCount++
+			}
+		}
+	}
+	currentApp.LocalConnectionMutex.Unlock()
+
+	// Retransmit remote connection messages (DATA_DOWN)
+	currentApp.RemoteConnectionMutex.Lock()
+	for connID, connection := range currentApp.RemoteConnections {
+		if connection.PendingAcks == nil {
+			continue
+		}
+
+		for seq, pendingAck := range connection.PendingAcks {
+			// Only retransmit messages that were sent through the failed pool connection
+			if pendingAck.PoolConnectionID == failedPoolConnectionID {
+				log.Debugf("Retransmitting DATA_DOWN message conn=%d seq=%d from failed pool connection %d",
+					connID, seq, failedPoolConnectionID)
+
+				// Send through a different pool connection and update the tracking
+				newPoolConnID := sendProtobufWithTracking(pendingAck.Message)
+				pendingAck.PoolConnectionID = newPoolConnID
+				retransmittedCount++
+			}
+		}
+	}
+	currentApp.RemoteConnectionMutex.Unlock()
+
+	if retransmittedCount > 0 {
+		log.Infof("Retransmitted %d pending messages from failed pool connection %d through other healthy connections",
+			retransmittedCount, failedPoolConnectionID)
+	}
+}
+
+// handleServerClientConnectionFailure handles the failure of a server-side client connection
+// while preserving all remote connections (they will continue through other healthy client connections)
+func handleServerClientConnectionFailure(failedClientConn *ServerClientConnection) {
+	if failedClientConn == nil {
+		return
+	}
+
+	log.Warnf("Handling failure of server client connection %d - preserving remote connections", failedClientConn.ID)
+
+	// Immediately close the failed connection to prevent further usage
+	if failedClientConn.Conn != nil {
+		failedClientConn.Conn.Close()
+		failedClientConn.Conn = nil
+	}
+
+	// Remove this connection from server-side pool atomically
+	serverClientMutex.Lock()
+	// Mark the connection as inactive first (while holding lock)
+	failedClientConn.Active = false
+
+	for i, conn := range serverClientConnections {
+		if conn.ID == failedClientConn.ID {
+			// Remove connection from slice
+			serverClientConnections = append(serverClientConnections[:i], serverClientConnections[i+1:]...)
+			break
+		}
+	}
+
+	// Check if we have any healthy client connections remaining
+	healthyClientCount := 0
+	for _, clientConn := range serverClientConnections {
+		if clientConn.Active && clientConn.Conn != nil {
+			healthyClientCount++
+		}
+	}
+	serverClientMutex.Unlock()
+
+	// Clear any pending ACKs that were meant for this failed connection to prevent retransmission attempts
+	clearPendingAcksForFailedConnection(failedClientConn.ID)
+
+	if healthyClientCount > 0 {
+		log.Infof("Server client connection %d failed, but %d healthy client connections remain - remote connections preserved",
+			failedClientConn.ID, healthyClientCount)
+		// Remote connections will automatically be rerouted to healthy client connections
+		// by the existing load balancing logic in sendProtobuf()
+	} else {
+		log.Warnf("Server client connection %d failed and no healthy client connections remain - clearing all connection state",
+			failedClientConn.ID)
+		// Only clear all connection state if ALL client connections are gone
+		clearConnectionState()
+	}
+
+	log.Debugf("Unregistered server client connection %d (remaining: %d)",
+		failedClientConn.ID, healthyClientCount)
+}
+
 // clearConnectionState clears potentially corrupted connection state
 func clearConnectionState() {
+	// Ensure only one clearConnectionState operation at a time to prevent race conditions
+	clearConnectionStateMutex.Lock()
+	defer clearConnectionStateMutex.Unlock()
+
 	currentApp := getApp() // Use safe app access
 	if currentApp == nil {
 		return
 	}
 
-	log.Warnf("Clearing connection state due to connection failure")
+	log.Warnf("Clearing connection state due to connection failure - preserving undelivered messages")
 
-	// Clear local connections (client side)
+	messagesPreserved := 0
+
+	// Clear local connections (client side) and preserve undelivered messages
 	currentApp.LocalConnectionMutex.Lock()
 	localCount := len(currentApp.LocalConnections)
 	for connID, conn := range currentApp.LocalConnections {
 		if conn.Connection != nil {
 			conn.Connection.Close()
 		}
-		// Explicitly clear buffer maps to free memory immediately
+
+		// Preserve messages from MessageQueue
+		for seqNum, message := range conn.MessageQueue {
+			queueUndeliveredMessage(message, connID, true)
+			messagesPreserved++
+			log.Tracef("Preserved local message seq=%d for connection %d", seqNum, connID)
+		}
+
+		// Preserve messages from PendingAcks
+		for seqNum, pendingAck := range conn.PendingAcks {
+			queueUndeliveredMessage(pendingAck.Message, connID, true)
+			messagesPreserved++
+			log.Tracef("Preserved local pending ACK seq=%d for connection %d", seqNum, connID)
+		}
+
+		// Clear buffer maps after preserving messages
 		conn.MessageQueue = nil
 		conn.PendingAcks = nil
-		conn.AckTimeouts = nil
 		delete(currentApp.LocalConnections, connID)
 	}
 	currentApp.LocalConnectionMutex.Unlock()
 
-	// Clear remote connections (server side)
+	// Clear remote connections (server side) and preserve undelivered messages
 	currentApp.RemoteConnectionMutex.Lock()
 	remoteCount := len(currentApp.RemoteConnections)
 	for connID, conn := range currentApp.RemoteConnections {
 		if conn.Connection != nil {
 			conn.Connection.Close()
 		}
-		// Explicitly clear buffer maps to free memory immediately
+
+		// Preserve messages from MessageQueue
+		for seqNum, message := range conn.MessageQueue {
+			queueUndeliveredMessage(message, connID, false)
+			messagesPreserved++
+			log.Tracef("Preserved remote message seq=%d for connection %d", seqNum, connID)
+		}
+
+		// Preserve messages from PendingAcks
+		for seqNum, pendingAck := range conn.PendingAcks {
+			queueUndeliveredMessage(pendingAck.Message, connID, false)
+			messagesPreserved++
+			log.Tracef("Preserved remote pending ACK seq=%d for connection %d", seqNum, connID)
+		}
+
+		// Clear buffer maps after preserving messages
 		conn.MessageQueue = nil
 		conn.PendingAcks = nil
-		conn.AckTimeouts = nil
 		delete(currentApp.RemoteConnections, connID)
 	}
 	currentApp.RemoteConnectionMutex.Unlock()
@@ -1158,7 +1668,9 @@ func clearConnectionState() {
 	}
 	protobufConnectionMutex.Unlock()
 
-	log.Infof("Cleared %d local and %d remote connections", localCount, remoteCount)
+	total, normal, priority := getUndeliveredMessageStats()
+	log.Infof("Cleared %d local and %d remote connections, preserved %d undelivered messages (queue: %d total, %d normal, %d priority)",
+		localCount, remoteCount, messagesPreserved, total, normal, priority)
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1275,6 +1787,18 @@ func serveMetrics(w http.ResponseWriter, r *http.Request) {
 		// Server-side metrics
 		generateServerMetrics(&metrics, currentApp)
 	}
+
+	// Add undelivered message queue statistics (available on both client and server)
+	total, normal, priority := getUndeliveredMessageStats()
+	metrics.WriteString("# HELP twt2_undelivered_messages_total Total number of undelivered messages in queues\n")
+	metrics.WriteString("# TYPE twt2_undelivered_messages_total gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_undelivered_messages_total %d\n", total))
+	metrics.WriteString("# HELP twt2_undelivered_messages_normal Number of normal undelivered messages in queue\n")
+	metrics.WriteString("# TYPE twt2_undelivered_messages_normal gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_undelivered_messages_normal %d\n", normal))
+	metrics.WriteString("# HELP twt2_undelivered_messages_priority Number of priority undelivered messages in queue\n")
+	metrics.WriteString("# TYPE twt2_undelivered_messages_priority gauge\n")
+	metrics.WriteString(fmt.Sprintf("twt2_undelivered_messages_priority %d\n", priority))
 
 	// Set appropriate headers for Prometheus metrics
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -1582,8 +2106,7 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 		Connection:   conn,
 		LastSeqIn:    0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 		LastAckSent:  0,
 	}
 	app.LocalConnectionMutex.Unlock()
@@ -1635,23 +2158,32 @@ func Hijack(w http.ResponseWriter, r *http.Request) {
 				Seq:        connRecord.LastSeqIn,
 				Data:       b[:n],
 			}
-			// Store message in PendingAcks for reliable delivery
+			// Store message in PendingAcks for reliable delivery and track which pool connection is used
 			if connRecord.PendingAcks == nil {
-				connRecord.PendingAcks = make(map[uint64]*twtproto.ProxyComm)
+				connRecord.PendingAcks = make(map[uint64]*PendingAck)
 			}
-			if connRecord.AckTimeouts == nil {
-				connRecord.AckTimeouts = make(map[uint64]time.Time)
+
+			// Send the message and get the pool connection ID used
+			poolConnID := sendProtobufWithTracking(dataMessage)
+
+			// Store the pending ACK with pool connection information
+			connRecord.PendingAcks[connRecord.LastSeqIn] = &PendingAck{
+				Message:          dataMessage,
+				PoolConnectionID: poolConnID,
 			}
-			connRecord.PendingAcks[connRecord.LastSeqIn] = dataMessage
-			connRecord.AckTimeouts[connRecord.LastSeqIn] = time.Now().Add(5 * time.Second) // 5 second timeout
 			app.LocalConnections[thisConnection] = connRecord
 			app.LocalConnectionMutex.Unlock()
-			sendProtobuf(dataMessage)
 		}
 	}
 }
 
 func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
+	// Check if connection is still valid before attempting to write
+	if conn == nil {
+		log.Tracef("Cannot send protobuf message: connection is nil")
+		return
+	}
+
 	data, err := proto.Marshal(message)
 	if err != nil {
 		log.Fatal("marshaling error: ", err)
@@ -1675,7 +2207,12 @@ func sendProtobufToConn(conn net.Conn, message *twtproto.ProxyComm) {
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	_, err = conn.Write(B)
 	if err != nil {
-		log.Warnf("Failed to write protobuf message: %v", err)
+		// Check if it's a closed connection error to reduce log noise
+		if strings.Contains(err.Error(), "use of closed network connection") {
+			log.Tracef("Connection closed while writing protobuf message: %v", err)
+		} else {
+			log.Warnf("Failed to write protobuf message: %v", err)
+		}
 		return
 	}
 	// Clear the deadline after successful write
@@ -1696,6 +2233,122 @@ func isHighPriorityMessage(message *twtproto.ProxyComm) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// sendProtobufWithTracking sends a protobuf message and returns the pool connection ID used
+// Returns 0 if sent via server-side connection or fallback connection
+func sendProtobufWithTracking(message *twtproto.ProxyComm) uint64 {
+	// Check if message is nil
+	if message == nil {
+		log.Warnf("Cannot send nil protobuf message")
+		return 0
+	}
+
+	// Check if app is initialized
+	currentApp := getApp()
+	if currentApp == nil {
+		log.Errorf("App not initialized, cannot send protobuf message")
+		return 0
+	}
+
+	// Check if we're in server mode (no pool connections)
+	if len(currentApp.PoolConnections) == 0 {
+		// Server mode - use regular sendProtobuf for server-side
+		sendProtobuf(message)
+		return 0 // Server-side connections don't have pool connection IDs
+	}
+
+	// Client mode - use pool connections and track which one was used
+	currentApp.PoolMutex.Lock()
+	defer currentApp.PoolMutex.Unlock()
+
+	// Find a healthy available pool connection using priority-based selection with LRU
+	var selectedConn *PoolConnection
+	var healthyConnections []*PoolConnection
+
+	// First pass - collect all healthy, available connections (highest priority)
+	for _, poolConn := range currentApp.PoolConnections {
+		if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy && !poolConn.InUse {
+			healthyConnections = append(healthyConnections, poolConn)
+		}
+	}
+
+	// Second pass - if no available connections, collect healthy but busy ones
+	if len(healthyConnections) == 0 {
+		for _, poolConn := range currentApp.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil && poolConn.Healthy {
+				healthyConnections = append(healthyConnections, poolConn)
+			}
+		}
+	}
+
+	// Third pass - if no healthy connections, collect any available connections
+	if len(healthyConnections) == 0 {
+		for _, poolConn := range currentApp.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil && !poolConn.InUse {
+				healthyConnections = append(healthyConnections, poolConn)
+			}
+		}
+	}
+
+	// Fourth pass - if still no connections, collect any connection with a valid Conn
+	if len(healthyConnections) == 0 {
+		for _, poolConn := range currentApp.PoolConnections {
+			if poolConn != nil && poolConn.Conn != nil {
+				healthyConnections = append(healthyConnections, poolConn)
+			}
+		}
+	}
+
+	// Always use least recently used (LRU) selection from collected connections
+	if len(healthyConnections) > 0 {
+		selectedConn = healthyConnections[0]
+		for _, poolConn := range healthyConnections {
+			if poolConn.LastUsed.Before(selectedConn.LastUsed) {
+				selectedConn = poolConn
+			}
+		}
+	}
+
+	if selectedConn == nil {
+		log.Errorf("No healthy pool connections available (total: %d)", len(currentApp.PoolConnections))
+		return 0
+	}
+
+	log.Tracef("Sending message via pool connection %d", selectedConn.ID)
+	selectedConn.LastUsed = time.Now()
+
+	// Determine which channel to use based on message priority
+	isHighPriority := isHighPriorityMessage(message)
+	targetChan := selectedConn.SendChan
+	channelType := "regular"
+
+	if isHighPriority && selectedConn.PriorityChan != nil {
+		targetChan = selectedConn.PriorityChan
+		channelType = "priority"
+	}
+
+	// Send message through the appropriate channel (non-blocking with timeout)
+	select {
+	case targetChan <- message:
+		log.Tracef("Message queued for pool connection %d (%s channel)", selectedConn.ID, channelType)
+		return selectedConn.ID
+	case <-time.After(5 * time.Second):
+		log.Warnf("Failed to queue message for pool connection %d (%s channel) - timeout", selectedConn.ID, channelType)
+		// Try fallback to regular channel if priority channel failed
+		if isHighPriority && channelType == "priority" {
+			fallbackChan := selectedConn.SendChan
+			select {
+			case fallbackChan <- message:
+				log.Tracef("Message queued for pool connection %d (fallback to regular channel)", selectedConn.ID)
+				return selectedConn.ID
+			default:
+				log.Errorf("Failed to queue message for pool connection %d (fallback also failed)", selectedConn.ID)
+				return 0
+			}
+		}
+		return 0
 	}
 }
 
@@ -1726,18 +2379,19 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 		serverClientMutex.RUnlock()
 
 		if len(availableConnections) == 0 {
+			log.Errorf("No active server client connections available for sending ACK_UP")
 			// Fallback to global protobuf connection if no client connections available
 			protobufConnectionMutex.RLock()
 			conn := protobufConnection
 			protobufConnectionMutex.RUnlock()
 
 			if conn != nil {
-				log.Tracef("Sending message via fallback protobuf connection")
+				log.Tracef("Sending ACK_UP via fallback protobuf connection")
 				sendProtobufToConn(conn, message)
 				return
 			}
 
-			log.Errorf("No active server client connections available")
+			log.Errorf("No active server client connections and no fallback protobuf connection available")
 			return
 		}
 
@@ -1749,7 +2403,7 @@ func sendProtobuf(message *twtproto.ProxyComm) {
 			}
 		}
 
-		log.Tracef("Sending message via server client connection %d (LRU)", selectedConn.ID)
+		log.Tracef("Sending ACK_UP via server client connection %d (LRU)", selectedConn.ID)
 		selectedConn.LastUsed = time.Now()
 		sendProtobufToConn(selectedConn.Conn, message)
 		return
@@ -1913,6 +2567,40 @@ var protobufConnection net.Conn          // Global variable to store the protobu
 var protobufConnectionMutex sync.RWMutex // Mutex to protect protobufConnection
 var protobufWriteMutex sync.Mutex        // Mutex to serialize protobuf writes and prevent frame corruption
 
+// Global channels for undelivered messages during connection failures
+var undeliveredMessageChan chan *UndeliveredMessage
+var undeliveredPriorityMessageChan chan *UndeliveredMessage
+var undeliveredMessageProcessor struct {
+	running bool
+	stop    chan struct{}
+	done    chan struct{}
+	mutex   sync.Mutex
+}
+
+// Ensure the undelivered message system is initialized only once
+var undeliveredMessageSystemOnce sync.Once
+
+// Global stats logger management
+var statsLogger struct {
+	running bool
+	stop    chan struct{}
+	done    chan struct{}
+	ticker  *time.Ticker
+	mutex   sync.Mutex
+}
+
+const undeliveredMessageBufferSize = 1000 // Buffer size for normal undelivered messages
+const undeliveredPriorityBufferSize = 100 // Buffer size for priority undelivered messages
+
+// UndeliveredMessage represents a message that couldn't be delivered due to connection failure
+type UndeliveredMessage struct {
+	Message      *twtproto.ProxyComm
+	ConnectionID uint64
+	IsLocal      bool // true for local connections, false for remote
+	Timestamp    time.Time
+	RetryCount   int
+}
+
 // Server-side client connection tracking for load balancing
 type ServerClientConnection struct {
 	Conn     net.Conn
@@ -1986,19 +2674,9 @@ func handleConnectionWithPoolConn(conn net.Conn, poolConn *PoolConnection) {
 	}
 
 	defer func() {
-		// Remove this connection from server-side pool when it closes
+		// Handle server client connection failure with proper isolation
 		if serverClientConn != nil {
-			serverClientMutex.Lock()
-			for i, conn := range serverClientConnections {
-				if conn.ID == serverClientConn.ID {
-					// Remove connection from slice
-					serverClientConnections = append(serverClientConnections[:i], serverClientConnections[i+1:]...)
-					break
-				}
-			}
-			serverClientMutex.Unlock()
-			log.Debugf("Unregistered server client connection %d (remaining: %d)",
-				serverClientConn.ID, len(serverClientConnections))
+			handleServerClientConnectionFailure(serverClientConn)
 		}
 
 		// Ensure connection is closed when this function exits
@@ -2138,6 +2816,11 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 		log.Tracef("Seq DOWN %d %d", message.Seq, thisConnection.NextSeqOut)
 		if message.Seq != thisConnection.NextSeqOut {
 			log.Tracef("Queueing message UP conn %d seq %d", message.Connection, message.Seq)
+			// Initialize MessageQueue if it's nil
+			if thisConnection.MessageQueue == nil {
+				thisConnection.MessageQueue = make(map[uint64]*twtproto.ProxyComm)
+				app.LocalConnections[message.Connection] = thisConnection
+			}
 			app.LocalConnections[message.Connection].MessageQueue[message.Seq] = message
 			mutex.Unlock()
 			return
@@ -2154,8 +2837,7 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 				LastSeqIn:    0,
 				NextSeqOut:   0,
 				MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-				PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-				AckTimeouts:  make(map[uint64]time.Time),
+				PendingAcks:  make(map[uint64]*PendingAck),
 				LastAckSent:  0,
 			}
 			thisConnection = app.RemoteConnections[message.Connection]
@@ -2164,11 +2846,16 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 		if message.Seq != thisConnection.NextSeqOut {
 			if message.Mt == twtproto.ProxyComm_CLOSE_CONN_S {
 				log.Tracef("Out of order processing of %v message for connection %d seq %d", message.Mt, message.Connection, message.Seq)
-				closeConnectionRemote(message)
+				closeConnectionRemoteNoLock(message)
 				mutex.Unlock()
 				return
 			}
 			log.Tracef("Queueing message UP conn %d seq %d", message.Connection, message.Seq)
+			// Initialize MessageQueue if it's nil
+			if thisConnection.MessageQueue == nil {
+				thisConnection.MessageQueue = make(map[uint64]*twtproto.ProxyComm)
+				app.RemoteConnections[message.Connection] = thisConnection
+			}
 			app.RemoteConnections[message.Connection].MessageQueue[message.Seq] = message
 			mutex.Unlock()
 			return
@@ -2177,13 +2864,13 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 	log.Tracef("Handling current message for connection %d", message.Connection)
 	switch message.Mt {
 	case twtproto.ProxyComm_OPEN_CONN:
-		newConnection(message)
+		newConnectionNoLock(message)
 	case twtproto.ProxyComm_CLOSE_CONN_C:
-		closeConnectionLocal(message)
+		closeConnectionLocalNoLock(message)
 	case twtproto.ProxyComm_DATA_DOWN:
 		backwardDataChunk(message)
 	case twtproto.ProxyComm_CLOSE_CONN_S:
-		closeConnectionRemote(message)
+		closeConnectionRemoteNoLock(message)
 	case twtproto.ProxyComm_DATA_UP:
 		forwardDataChunk(message)
 	}
@@ -2198,11 +2885,11 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 		//    log.Tracef("Message: %v", queueMessage)
 		switch queueMessage.Mt {
 		case twtproto.ProxyComm_CLOSE_CONN_C:
-			closeConnectionLocal(queueMessage)
+			closeConnectionLocalNoLock(queueMessage)
 		case twtproto.ProxyComm_DATA_DOWN:
 			backwardDataChunk(queueMessage)
 		case twtproto.ProxyComm_CLOSE_CONN_S:
-			closeConnectionRemote(queueMessage)
+			closeConnectionRemoteNoLock(queueMessage)
 		case twtproto.ProxyComm_DATA_UP:
 			forwardDataChunk(queueMessage)
 		}
@@ -2214,6 +2901,13 @@ func handleProxycommMessageWithPoolConn(message *twtproto.ProxyComm, poolConn *P
 }
 
 func newConnection(message *twtproto.ProxyComm) {
+	app.RemoteConnectionMutex.Lock()
+	defer app.RemoteConnectionMutex.Unlock()
+
+	newConnectionNoLock(message)
+}
+
+func newConnectionNoLock(message *twtproto.ProxyComm) {
 	log.Infof("Openning connection %4d to %s:%d", message.Connection, message.Address, message.Port)
 
 	// Track this connection for server statistics
@@ -2252,8 +2946,7 @@ func newConnection(message *twtproto.ProxyComm) {
 			LastSeqIn:    0,
 			NextSeqOut:   1,
 			MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-			PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-			AckTimeouts:  make(map[uint64]time.Time),
+			PendingAcks:  make(map[uint64]*PendingAck),
 			LastAckSent:  0,
 		}
 	} else {
@@ -2268,6 +2961,13 @@ func newConnection(message *twtproto.ProxyComm) {
 func closeConnectionRemote(message *twtproto.ProxyComm) {
 	log.Debugf("Closing remote connection %4d", message.Connection)
 
+	app.RemoteConnectionMutex.Lock()
+	defer app.RemoteConnectionMutex.Unlock()
+
+	closeConnectionRemoteNoLock(message)
+}
+
+func closeConnectionRemoteNoLock(message *twtproto.ProxyComm) {
 	connRecord, ok := app.RemoteConnections[message.Connection]
 	if ok {
 		conn := connRecord.Connection
@@ -2275,7 +2975,6 @@ func closeConnectionRemote(message *twtproto.ProxyComm) {
 		// Explicitly clear buffer maps to free memory immediately
 		connRecord.MessageQueue = nil
 		connRecord.PendingAcks = nil
-		connRecord.AckTimeouts = nil
 
 		delete(app.RemoteConnections, message.Connection)
 		time.AfterFunc(1*time.Second, func() {
@@ -2289,6 +2988,13 @@ func closeConnectionRemote(message *twtproto.ProxyComm) {
 func closeConnectionLocal(message *twtproto.ProxyComm) {
 	log.Debugf("Closing local connection %4d", message.Connection)
 
+	app.LocalConnectionMutex.Lock()
+	defer app.LocalConnectionMutex.Unlock()
+
+	closeConnectionLocalNoLock(message)
+}
+
+func closeConnectionLocalNoLock(message *twtproto.ProxyComm) {
 	connRecord, ok := app.LocalConnections[message.Connection]
 	if ok {
 		conn := connRecord.Connection
@@ -2296,7 +3002,6 @@ func closeConnectionLocal(message *twtproto.ProxyComm) {
 		// Explicitly clear buffer maps to free memory immediately
 		connRecord.MessageQueue = nil
 		connRecord.PendingAcks = nil
-		connRecord.AckTimeouts = nil
 
 		delete(app.LocalConnections, message.Connection)
 		time.AfterFunc(1*time.Second, func() { conn.Close() })
@@ -2359,6 +3064,7 @@ func forwardDataChunk(message *twtproto.ProxyComm) {
 		Connection: message.Connection,
 		Seq:        message.Seq,
 	}
+	log.Debugf("Attempting to send ACK_UP for connection %d, seq %d", message.Connection, message.Seq)
 	sendProtobuf(ackMessage)
 	log.Tracef("Sent ACK_UP for connection %d, seq %d", message.Connection, message.Seq)
 
@@ -2409,15 +3115,11 @@ func handleAckDown(message *twtproto.ProxyComm) {
 
 	// Initialize maps if they don't exist (for backward compatibility)
 	if thisConnection.PendingAcks == nil {
-		thisConnection.PendingAcks = make(map[uint64]*twtproto.ProxyComm)
-	}
-	if thisConnection.AckTimeouts == nil {
-		thisConnection.AckTimeouts = make(map[uint64]time.Time)
+		thisConnection.PendingAcks = make(map[uint64]*PendingAck)
 	}
 
-	// Remove the acknowledged message from pending ACKs and timeouts
+	// Remove the acknowledged message from pending ACKs
 	delete(thisConnection.PendingAcks, message.Seq)
-	delete(thisConnection.AckTimeouts, message.Seq)
 
 	log.Debugf("ACK_DOWN processed for connection %d, seq %d - removed from pending", message.Connection, message.Seq)
 }
@@ -2445,15 +3147,11 @@ func handleAckUp(message *twtproto.ProxyComm) {
 
 	// Initialize maps if they don't exist (for backward compatibility)
 	if thisConnection.PendingAcks == nil {
-		thisConnection.PendingAcks = make(map[uint64]*twtproto.ProxyComm)
-	}
-	if thisConnection.AckTimeouts == nil {
-		thisConnection.AckTimeouts = make(map[uint64]time.Time)
+		thisConnection.PendingAcks = make(map[uint64]*PendingAck)
 	}
 
-	// Remove the acknowledged message from pending ACKs and timeouts
+	// Remove the acknowledged message from pending ACKs
 	delete(thisConnection.PendingAcks, message.Seq)
-	delete(thisConnection.AckTimeouts, message.Seq)
 
 	log.Debugf("ACK_UP processed for connection %d, seq %d - removed from pending", message.Connection, message.Seq)
 }
@@ -2466,16 +3164,22 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 		if err != nil {
 			if err == io.EOF {
 				log.Infof("Server closed connection %d, going to send CLOSE_CONN_C message to client end", connID)
-				app.RemoteConnectionMutex.Lock()
-				connRecord, ok := app.RemoteConnections[connID]
+				currentApp := getApp()
+				if currentApp == nil {
+					log.Tracef("App is nil, exiting remote connection handler for connection %d", connID)
+					conn.Close()
+					return
+				}
+				currentApp.RemoteConnectionMutex.Lock()
+				connRecord, ok := currentApp.RemoteConnections[connID]
 				if !ok {
 					log.Tracef("Connection %d was already closed and removed earlier, exiting goroutine", connID)
-					app.RemoteConnectionMutex.Unlock()
+					currentApp.RemoteConnectionMutex.Unlock()
 					return
 				}
 				seq := connRecord.LastSeqIn
-				delete(app.RemoteConnections, connID)
-				app.RemoteConnectionMutex.Unlock()
+				delete(currentApp.RemoteConnections, connID)
+				currentApp.RemoteConnectionMutex.Unlock()
 				closeMessage := &twtproto.ProxyComm{
 					Mt:         twtproto.ProxyComm_CLOSE_CONN_C,
 					Proxy:      proxyID,
@@ -2522,15 +3226,19 @@ func handleRemoteSideConnection(conn net.Conn, connID uint64) {
 			Seq:        seq,
 			Data:       b[:n],
 		}
-		// Store message in PendingAcks for reliable delivery
+		// Store message in PendingAcks for reliable delivery and track which pool connection is used
 		if connRecord.PendingAcks == nil {
-			connRecord.PendingAcks = make(map[uint64]*twtproto.ProxyComm)
+			connRecord.PendingAcks = make(map[uint64]*PendingAck)
 		}
-		if connRecord.AckTimeouts == nil {
-			connRecord.AckTimeouts = make(map[uint64]time.Time)
+
+		// Send the message and get the pool connection ID used (0 for server-side)
+		poolConnID := sendProtobufWithTracking(dataMessage)
+
+		// Store the pending ACK with pool connection information
+		connRecord.PendingAcks[seq] = &PendingAck{
+			Message:          dataMessage,
+			PoolConnectionID: poolConnID,
 		}
-		connRecord.PendingAcks[seq] = dataMessage
-		connRecord.AckTimeouts[seq] = time.Now().Add(5 * time.Second) // 5 second timeout
 		currentApp.RemoteConnections[connID] = connRecord
 		currentApp.RemoteConnectionMutex.Unlock()
 		//    log.Tracef("%s", hex.Dump(b[:n]))

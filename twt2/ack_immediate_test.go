@@ -3,7 +3,6 @@ package twt2
 import (
 	"sync"
 	"testing"
-	"time"
 
 	"palecci.cz/twtproto"
 )
@@ -29,8 +28,7 @@ func TestAckImmediateProcessing(t *testing.T) {
 		Connection:   mockLocalConn,
 		NextSeqOut:   0, // This is key - expecting sequence 0
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 	}
 
 	// Set up remote connection with NextSeqOut = 0
@@ -39,13 +37,12 @@ func TestAckImmediateProcessing(t *testing.T) {
 		Connection:   mockRemoteConn,
 		NextSeqOut:   0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 	}
 
 	// Add some pending ACKs for testing
-	app.LocalConnections[1].PendingAcks[5] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 5}
-	app.RemoteConnections[1].PendingAcks[3] = &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 3}
+	app.LocalConnections[1].PendingAcks[5] = &PendingAck{Message: &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_UP, Seq: 5}, PoolConnectionID: 1}
+	app.RemoteConnections[1].PendingAcks[3] = &PendingAck{Message: &twtproto.ProxyComm{Mt: twtproto.ProxyComm_DATA_DOWN, Seq: 3}, PoolConnectionID: 1}
 
 	// Test 1: ACK_UP with sequence 5 should be processed immediately
 	// even though connection expects sequence 0

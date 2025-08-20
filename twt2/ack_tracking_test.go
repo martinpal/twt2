@@ -2,7 +2,6 @@ package twt2
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"palecci.cz/twtproto"
@@ -27,8 +26,7 @@ func TestAckTrackingInitialization(t *testing.T) {
 		LastSeqIn:    0,
 		NextSeqOut:   0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 		LastAckSent:  0,
 	}
 
@@ -36,10 +34,8 @@ func TestAckTrackingInitialization(t *testing.T) {
 
 	// Verify initialization
 	assert.NotNil(t, testApp.LocalConnections[connID].PendingAcks)
-	assert.NotNil(t, testApp.LocalConnections[connID].AckTimeouts)
 	assert.Equal(t, uint64(0), testApp.LocalConnections[connID].LastAckSent)
 	assert.Equal(t, 0, len(testApp.LocalConnections[connID].PendingAcks))
-	assert.Equal(t, 0, len(testApp.LocalConnections[connID].AckTimeouts))
 }
 
 // TestHandleAckDown tests ACK_DOWN message handling
@@ -62,8 +58,7 @@ func TestHandleAckDown(t *testing.T) {
 		LastSeqIn:    0,
 		NextSeqOut:   0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 		LastAckSent:  0,
 	}
 
@@ -74,13 +69,11 @@ func TestHandleAckDown(t *testing.T) {
 		Seq:        seq,
 		Data:       []byte("test data"),
 	}
-	conn.PendingAcks[seq] = dataMessage
-	conn.AckTimeouts[seq] = time.Now().Add(5 * time.Second)
+	conn.PendingAcks[seq] = &PendingAck{Message: dataMessage, PoolConnectionID: 1}
 	testApp.RemoteConnections[connID] = conn
 
 	// Verify pending ACK exists
 	assert.Equal(t, 1, len(testApp.RemoteConnections[connID].PendingAcks))
-	assert.Equal(t, 1, len(testApp.RemoteConnections[connID].AckTimeouts))
 
 	// Create ACK message
 	ackMessage := &twtproto.ProxyComm{
@@ -95,7 +88,6 @@ func TestHandleAckDown(t *testing.T) {
 	// Verify pending ACK was removed
 	currentApp := getApp()
 	assert.Equal(t, 0, len(currentApp.RemoteConnections[connID].PendingAcks))
-	assert.Equal(t, 0, len(currentApp.RemoteConnections[connID].AckTimeouts))
 }
 
 // TestHandleAckUp tests ACK_UP message handling
@@ -118,8 +110,7 @@ func TestHandleAckUp(t *testing.T) {
 		LastSeqIn:    0,
 		NextSeqOut:   0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 		LastAckSent:  0,
 	}
 
@@ -130,13 +121,11 @@ func TestHandleAckUp(t *testing.T) {
 		Seq:        seq,
 		Data:       []byte("test data up"),
 	}
-	conn.PendingAcks[seq] = dataMessage
-	conn.AckTimeouts[seq] = time.Now().Add(5 * time.Second)
+	conn.PendingAcks[seq] = &PendingAck{Message: dataMessage, PoolConnectionID: 1}
 	testApp.LocalConnections[connID] = conn
 
 	// Verify pending ACK exists
 	assert.Equal(t, 1, len(testApp.LocalConnections[connID].PendingAcks))
-	assert.Equal(t, 1, len(testApp.LocalConnections[connID].AckTimeouts))
 
 	// Create ACK message
 	ackMessage := &twtproto.ProxyComm{
@@ -151,7 +140,6 @@ func TestHandleAckUp(t *testing.T) {
 	// Verify pending ACK was removed
 	currentApp := getApp()
 	assert.Equal(t, 0, len(currentApp.LocalConnections[connID].PendingAcks))
-	assert.Equal(t, 0, len(currentApp.LocalConnections[connID].AckTimeouts))
 }
 
 // TestHandleAckNonexistentConnection tests ACK handling for nonexistent connections
@@ -207,8 +195,7 @@ func TestAckTimeoutDetection(t *testing.T) {
 		LastSeqIn:    0,
 		NextSeqOut:   0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 		LastAckSent:  0,
 	}
 
@@ -219,15 +206,11 @@ func TestAckTimeoutDetection(t *testing.T) {
 		Seq:        seq,
 		Data:       []byte("test data"),
 	}
-	conn.PendingAcks[seq] = dataMessage
-	conn.AckTimeouts[seq] = time.Now().Add(-1 * time.Second) // Past timeout
+	conn.PendingAcks[seq] = &PendingAck{Message: dataMessage, PoolConnectionID: 1}
 	testApp.LocalConnections[connID] = conn
 
-	// Check if timeout detection logic works
-	now := time.Now()
-	timeout := testApp.LocalConnections[connID].AckTimeouts[seq]
-
-	assert.True(t, now.After(timeout), "Timeout should be detected as expired")
+	// Verify pending ACK exists (no more timeout logic since we removed timer-based retransmission)
+	assert.Equal(t, 1, len(testApp.LocalConnections[connID].PendingAcks))
 }
 
 // TestMultiplePendingAcks tests handling multiple pending ACKs
@@ -250,8 +233,7 @@ func TestMultiplePendingAcks(t *testing.T) {
 		LastSeqIn:    0,
 		NextSeqOut:   0,
 		MessageQueue: make(map[uint64]*twtproto.ProxyComm),
-		PendingAcks:  make(map[uint64]*twtproto.ProxyComm),
-		AckTimeouts:  make(map[uint64]time.Time),
+		PendingAcks:  make(map[uint64]*PendingAck),
 		LastAckSent:  0,
 	}
 
@@ -263,14 +245,12 @@ func TestMultiplePendingAcks(t *testing.T) {
 			Seq:        i,
 			Data:       []byte("test data"),
 		}
-		conn.PendingAcks[i] = dataMessage
-		conn.AckTimeouts[i] = time.Now().Add(5 * time.Second)
+		conn.PendingAcks[i] = &PendingAck{Message: dataMessage, PoolConnectionID: i} // Use different pool IDs for testing
 	}
 	testApp.RemoteConnections[connID] = conn
 
 	// Verify all are stored
 	assert.Equal(t, 5, len(testApp.RemoteConnections[connID].PendingAcks))
-	assert.Equal(t, 5, len(testApp.RemoteConnections[connID].AckTimeouts))
 
 	// ACK middle message
 	ackMessage := &twtproto.ProxyComm{
@@ -283,11 +263,8 @@ func TestMultiplePendingAcks(t *testing.T) {
 	// Verify only the ACKed message was removed
 	currentApp := getApp()
 	assert.Equal(t, 4, len(currentApp.RemoteConnections[connID].PendingAcks))
-	assert.Equal(t, 4, len(currentApp.RemoteConnections[connID].AckTimeouts))
 	_, exists := currentApp.RemoteConnections[connID].PendingAcks[3]
 	assert.False(t, exists, "Sequence 3 should be removed")
-	_, exists = currentApp.RemoteConnections[connID].AckTimeouts[3]
-	assert.False(t, exists, "Timeout for sequence 3 should be removed")
 
 	// Verify others still exist
 	for _, seq := range []uint64{1, 2, 4, 5} {
